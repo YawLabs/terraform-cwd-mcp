@@ -1,0 +1,951 @@
+#!/bin/bash
+# =============================================================================
+# Release Script -- Test, bump, tag, publish to npm, create GitHub release
+# =============================================================================
+# Usage:
+#   ./release.sh <new-version>    -- local mode, e.g. ./release.sh 0.9.1
+#   ./release.sh                  -- CI mode (version derived from git tag)
+#
+# Local mode: runs from your workstation, bumps + commits + tags + pushes.
+# CI mode: invoked by .github/workflows/release.yml on tag push, skips the
+# bump/commit/tag/push steps (already done) and publishes with --provenance
+# using NODE_AUTH_TOKEN from GitHub Actions secrets.
+# If interrupted, just re-run with the same version -- each step is idempotent.
+#
+# Prerequisites (local):
+#   - gh CLI authenticated
+#   - npm automation token in ~/.npmrc (npmjs.com -> Access Tokens -> Generate
+#     -> Automation). Do NOT use `npm login --auth-type=web` -- it OVERWRITES
+#     that automation token with a 2FA-bound web session, and the next publish
+#     then EOTPs on a WebAuthn challenge.
+#   - clean git working tree on main, up to date with origin/main
+# Prerequisites (CI): NODE_AUTH_TOKEN env, GITHUB_TOKEN env, CI=true.
+# =============================================================================
+
+set -euo pipefail
+trap 'echo -e "\n\033[0;31m  x Release failed at line $LINENO (exit code $?)\033[0m"' ERR
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+step() { echo -e "\n${CYAN}=== [$1/$TOTAL_STEPS] $2 ===${NC}"; }
+info() { echo -e "${GREEN}  + $1${NC}"; }
+warn() { echo -e "${YELLOW}  ! $1${NC}"; }
+fail() { echo -e "${RED}  x $1${NC}"; exit 1; }
+
+# --- CHANGELOG promotion (ported from ssh-mcp / aws-mcp, originally ctxlint) -
+# Every release now gets a `## [<version>]` entry, and step 6 sources the
+# release notes from it:
+#   * [Unreleased] has content -> it becomes the version section, and a fresh,
+#     empty [Unreleased] heading is left above it for the next change.
+#   * [Unreleased] is empty or absent -> a version section is generated from
+#     the commit subjects since the previous tag. Raw subjects are less than a
+#     hand-written entry, but a version with no entry at all reads as a mistake.
+#   * The Keep-a-Changelog link references at the bottom, when the file has
+#     them, are moved along: [Unreleased] compares from the new tag, and the
+#     version gets its own compare link.
+
+changelog_section() {
+  [ -f CHANGELOG.md ] || return 0
+  awk -v heading="$1" '
+    index($0, "## [" heading "]") == 1 { capture=1; next }
+    capture && /^## \[/ { exit }
+    capture { print }
+  ' CHANGELOG.md
+}
+
+# True when a section body carries any non-whitespace content.
+changelog_nonempty() { [ -n "$(echo "$1" | tr -d '[:space:]')" ]; }
+
+# Reuse whatever separator this file already puts between version and date.
+# The fleet mixes an em-dash and "--"; promoting with a hardcoded one would
+# introduce a third style into whichever repos do not use it.
+changelog_dash() {
+  local d
+  d=$(sed -nE 's/^## \[[0-9][^]]*\][[:space:]]+([^[:space:]]+)[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}.*/\1/p' CHANGELOG.md 2>/dev/null | head -1)
+  if [ -n "$d" ]; then printf '%s' "$d"; else printf '%s' '--'; fi
+}
+
+# The tag this release is compared against: the newest v* tag reachable from
+# HEAD other than this release's own (a re-run after tagging must not compare
+# the version with itself). Empty on a first release.
+changelog_prev_tag() {
+  git describe --tags --abbrev=0 --match 'v*' --exclude "v${VERSION}" 2>/dev/null || true
+}
+
+# The body of a generated entry: one bullet per commit subject since the
+# previous tag, newest first, with version-bump commits dropped.
+changelog_generated_body() {
+  local prev=$1 range subjects
+  if [ -n "$prev" ]; then range="${prev}..HEAD"; else range="HEAD"; fi
+  subjects=$(git log --no-merges --format='%s' "$range" 2>/dev/null \
+    | grep -vE '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^/- /' || true)
+  [ -n "$subjects" ] || subjects="- Maintenance release; no changes since ${prev:-the previous release}."
+  printf '### Changed\n%s\n' "$subjects"
+}
+
+# Keep-a-Changelog link references, when the file uses them: [Unreleased]
+# compares from the new tag, and the version gets its own compare link (or a
+# tag link on a first release). A version link that already exists is kept.
+changelog_update_links() {
+  local prev=$1 tmp
+  grep -qE '^\[Unreleased\]: .*/compare/.*\.\.\.HEAD' CHANGELOG.md || return 0
+  tmp=$(mktemp)
+  awk -v ver="$VERSION" -v prev="$prev" -v have_link="$(grep -c "^\[${VERSION}\]: " CHANGELOG.md || true)" '
+    !done && /^\[Unreleased\]: .*\/compare\/.*\.\.\.HEAD/ {
+      url=$0; sub(/^\[Unreleased\]: /, "", url); sub(/\/compare\/.*$/, "", url)
+      print "[Unreleased]: " url "/compare/v" ver "...HEAD"
+      if (have_link == 0) {
+        if (prev != "") print "[" ver "]: " url "/compare/" prev "...v" ver
+        else print "[" ver "]: " url "/releases/tag/v" ver
+      }
+      done=1; next
+    }
+    { print }
+  ' CHANGELOG.md > "$tmp" || { rm -f "$tmp"; fail "CHANGELOG.md link update failed"; }
+  mv "$tmp" CHANGELOG.md
+}
+
+# Make sure `## [<version>] <dash> <today>` exists: promote [Unreleased] when it
+# has content, otherwise generate the section from the commit subjects.
+promote_changelog() {
+  [ -f CHANGELOG.md ] || return 0
+  local prev
+  prev=$(changelog_prev_tag)
+  if changelog_nonempty "$(changelog_section "$VERSION")"; then
+    info "CHANGELOG.md already has an entry for v${VERSION}"
+    changelog_update_links "$prev"
+    return 0
+  fi
+  local today tmp dash heading body
+  today=$(date +%F)
+  dash=$(changelog_dash)
+  heading="## [${VERSION}] ${dash} ${today}"
+  tmp=$(mktemp)
+  if changelog_nonempty "$(changelog_section "Unreleased")"; then
+    # Rewrite only the FIRST [Unreleased] heading: a stray later mention (a link
+    # reference, a quoted example) must not become a second, bogus heading.
+    awk -v repl="$heading" '
+      !promoted && index($0, "## [Unreleased]") == 1 { print "## [Unreleased]"; print ""; print repl; promoted=1; next }
+      { print }
+    ' CHANGELOG.md > "$tmp" || { rm -f "$tmp"; fail "CHANGELOG.md promotion failed"; }
+    info "CHANGELOG.md: promoted [Unreleased] -> [${VERSION}] ${dash} ${today}"
+  else
+    body=$(changelog_generated_body "$prev")
+    warn "CHANGELOG.md has no [Unreleased] content -- writing [${VERSION}] from the commit subjects since ${prev:-the first commit}; edit it if they undersell the release"
+    # Insert below an empty [Unreleased] heading, else above the first version
+    # heading, else at the end of the file.
+    awk -v heading="$heading" -v body="$body" '
+      !done && index($0, "## [Unreleased]") == 1 { print; print ""; print heading; print ""; print body; done=1; next }
+      !done && /^## \[/ { print heading; print ""; print body; print ""; done=1 }
+      { print }
+      END { if (!done) { print ""; print heading; print ""; print body } }
+    ' CHANGELOG.md > "$tmp" || { rm -f "$tmp"; fail "CHANGELOG.md entry generation failed"; }
+    info "CHANGELOG.md: added [${VERSION}] ${dash} ${today} from commit subjects"
+  fi
+  mv "$tmp" CHANGELOG.md
+  changelog_update_links "$prev"
+}
+
+# Backstop for the promotion above: every release has an entry now, so a
+# missing one means promote_changelog did not run or did not land, and the
+# release notes in step 6 would silently fall back to commit subjects.
+assert_changelog_promoted() {
+  [ -f CHANGELOG.md ] || return 0
+  changelog_nonempty "$(changelog_section "$VERSION")" && return 0
+  fail "CHANGELOG.md has no '## [${VERSION}]' entry -- promote_changelog did not run or did not land."
+}
+
+# Release notes for step 6: the version's changelog section, trimmed of the
+# blank lines around it; commit subjects only when there is no changelog.
+release_notes() {
+  local notes
+  notes=$(changelog_section "$VERSION" | sed -e '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+  if changelog_nonempty "$notes"; then
+    printf '%s\n' "$notes"
+  elif [ -n "${1:-}" ] && [ "$1" != "v${VERSION}" ]; then
+    git log --oneline "${1}..v${VERSION}" --no-decorate | sed 's/^[a-f0-9]* /- /'
+  else
+    printf 'Initial release\n'
+  fi
+}
+
+# True when npm itself serves @yawlabs/terraform-cwd-mcp@${VERSION}: a 200 from the
+# per-version document, the same path the MCP Registry's validator fetches. NOT
+# `npm view`: that reads the whole packument, which registry.npmjs.org serves
+# from Cloudflare's edge for up to 300 s (Cache-Control: public, max-age=300;
+# measured 2026-09-28 still HIT with no-cache request headers), so right after
+# a publish it can keep saying the version is absent. The per-version document
+# is served uncached (CF-Cache-Status DYNAMIC). The `_` query is belt-and-braces
+# against that changing; npm ignores it. Probe-only: any failure reads as "not
+# served".
+npm_version_live() {
+  local code
+  if command -v curl >/dev/null 2>&1; then
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+      -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      "https://registry.npmjs.org/@yawlabs%2Fterraform-cwd-mcp/${VERSION}?_=$(date +%s)${RANDOM}" 2>/dev/null || true)
+    [ "$code" = "200" ]
+  else
+    [ "$(npm view "@yawlabs/terraform-cwd-mcp@${VERSION}" version --prefer-online 2>/dev/null || echo "")" = "$VERSION" ]
+  fi
+}
+
+# SKIP_LINT=1 escape hatch -- wraps `npm`/`pnpm` so lint-related runs are
+# no-ops.
+#
+# THIS SHOULD NOW BE UNNECESSARY, and reaching for it is a signal something
+# regressed. `npm run lint` routes through scripts/lint.mjs, which runs biome
+# from a binary that works on this host: on Windows ARM64 it provisions the x64
+# build of the SAME version package-lock.json installs and runs that under
+# emulation.
+#
+# The earlier text here blamed "the MINGW64-ARM64 npm-run-script wrapper" and
+# justified skipping with "CI catches lint regressions anyway". Both were wrong.
+# `npm run` is fine on that host (a plain node script through the same wrapper
+# exits 0); the SIGSEGV comes from the arm64 biome executable itself
+# (`@biomejs/cli-win32-arm64/biome.exe`), reproduced in @yawlabs/aws-mcp by
+# invoking that binary directly with no npm in the picture. Nor is it a
+# permanent arm64 defect: measured on this host, arm64 biome 2.5.4 exits 139,
+# while 2.4.16 and 2.5.13 check a tree and report normally. The wrapper routes
+# around the arm64 build regardless of version so that a later bump landing on
+# a bad one cannot turn this gate into a crash mid-release.
+#
+# And there is no CI to fall back on: this repo has no .github/workflows
+# directory and GitHub Actions is disabled on it, so nothing downstream
+# re-checks formatting -- skipping the lint step means the release is published
+# unlinted, full stop.
+#
+# So: only set SKIP_LINT=1 if scripts/lint.mjs cannot produce a result at all,
+# and treat that as a bug to fix rather than a step to routinely skip.
+if [ "${SKIP_LINT:-}" = "1" ]; then
+  npm() {
+    if [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
+      warn "SKIP_LINT=1 -- noop 'npm run $2'"
+      return 0
+    fi
+    command npm "$@"
+  }
+  pnpm() {
+    if [ "$1" = "run" ] && [[ "$2" == lint* ]]; then
+      warn "SKIP_LINT=1 -- noop 'pnpm run $2'"
+      return 0
+    fi
+    command pnpm "$@"
+  }
+fi
+
+TOTAL_STEPS=8
+
+IS_CI="${CI:-false}"
+VERSION="${1:-}"
+
+if [ -z "$VERSION" ]; then
+  if [ "$IS_CI" = "true" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
+    VERSION="${GITHUB_REF_NAME#v}"
+    info "CI mode -- version $VERSION from tag $GITHUB_REF_NAME"
+  else
+    echo "Usage: ./release.sh <version>"
+    echo "  e.g. ./release.sh 0.9.1"
+    exit 1
+  fi
+fi
+
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  fail "Invalid version format: $VERSION (expected X.Y.Z)"
+fi
+
+echo -e "${CYAN}Pre-flight checks...${NC}"
+
+command -v node >/dev/null || fail "node not installed"
+command -v npm >/dev/null  || fail "npm not installed"
+# gh is only required in local mode -- CI uses GITHUB_TOKEN with the gh action.
+if [ "$IS_CI" != "true" ]; then
+  command -v gh >/dev/null || fail "gh CLI not installed"
+fi
+
+# Branch check: in CI we are on a detached HEAD at the tag commit, which is fine.
+if [ "$IS_CI" != "true" ]; then
+  CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+  if [ "$CURRENT_BRANCH" != "main" ]; then
+    fail "Must be on main (currently on '$CURRENT_BRANCH')"
+  fi
+fi
+
+CURRENT_VERSION=$(node -p "require('./package.json').version")
+
+if [ "$CURRENT_VERSION" = "$VERSION" ]; then
+  info "Resuming release v${VERSION}"
+else
+  info "Current version: $CURRENT_VERSION -> $VERSION"
+fi
+
+if [ "$IS_CI" != "true" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
+  echo ""
+  echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
+  echo "  1. Run lint, typecheck, build, tests, the oam floor check and the MCP compliance gate"
+  echo "  2. Bump version in package.json"
+  echo "  3. Commit, tag, and push"
+  echo "  4. Publish to npm"
+  echo "  5. Create GitHub release"
+  echo ""
+  if [ -t 0 ]; then
+    read -p "Continue? (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      echo "Aborted."
+      exit 0
+    fi
+  else
+    info "Non-interactive shell -- proceeding without confirmation"
+  fi
+fi
+
+# Step 1: Lint, typecheck, build, test
+step 1 "Lint, typecheck, build, test, oam floor, compliance"
+
+npm run lint || fail "Lint failed (run 'npm run lint:fix')"
+npm run typecheck || fail "Type check failed"
+npm run build || fail "Build failed"
+npm test || fail "Tests failed"
+
+# oam floor: consistent and current (ported from caddy-mcp). `npm test` already
+# ran the offline half (src/tests/oam-floor.test.ts: every floor claim in the
+# repo agrees with OAM_MIN in bin/terraform-cwd-mcp.mjs). This adds the online
+# half: is OAM_MIN behind the latest published oam release? The launcher is
+# verified on one oam release at a time, so a stale floor means shipping on an
+# oam nobody re-verified against. TERRAFORM_CWD_MCP_ALLOW_STALE_OAM=1 is the
+# deliberate way past it. A machine with no network is not a failure -- the
+# check says so and continues.
+node scripts/check-oam-floor.mjs || fail "oam floor check failed -- see above. Set TERRAFORM_CWD_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately."
+
+# MCP compliance gate, before anything is tagged. Yaw MCP grades every server it
+# fronts with @yawlabs/mcp-compliance and blocks one below its minimum, so a
+# regression that drops the grade must stop the release here, not surface for
+# users. The grader is a pinned devDependency (same version line Yaw MCP grades
+# with) and runs against dist/ over stdio, so it needs no network. Skipped tests
+# and grader warnings are printed as warnings; a missing grader is a failure, not
+# a skip.
+node scripts/check-compliance.mjs || fail "MCP compliance gate failed -- the server must grade A (see above)"
+
+info "All checks passed"
+
+# Step 2: Bump version
+step 2 "Bump version to $VERSION"
+
+# Re-read CURRENT_VERSION from disk here, not the value captured at script-start:
+# `npm version` below mutates package.json, and a stale cached value would make
+# the skip-logic here disagree with the file's actual state on a resume run.
+# Matches the discipline in mcp-hosting's release.sh (dafdc9f).
+CURRENT_VERSION=$(node -p "require('./package.json').version")
+
+if [ "$CURRENT_VERSION" = "$VERSION" ]; then
+  info "Already at v${VERSION} -- skipping"
+else
+  npm version "$VERSION" --no-git-tag-version
+  info "package.json updated"
+  # Reflect the post-bump value so the display below ("v${VERSION} released")
+  # and any later steps that consult CURRENT_VERSION see the truth on disk.
+  CURRENT_VERSION="$VERSION"
+fi
+
+# server.json is published to the MCP Registry in step 7 and must match the
+# tag's version. This runs UNCONDITIONALLY (not inside the bump else above)
+# so a resume run where package.json was bumped in a prior invocation still
+# syncs server.json -- otherwise mcp-publisher tries to re-publish the
+# previous version and gets 400 "cannot publish duplicate version".
+# Idempotent: the inner if skips the write when server.json is already in
+# sync, so a clean re-run produces no working-tree dirt.
+if [ -f server.json ]; then
+  CURRENT_SERVER_VERSION=$(jq -r '.version' server.json 2>/dev/null || echo "")
+  if [ "$CURRENT_SERVER_VERSION" != "$VERSION" ]; then
+    jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
+    mv server.tmp server.json
+    info "server.json synced to $VERSION"
+  fi
+fi
+
+# Promote the heading BEFORE the bump commit, so the rewrite is committed
+# with the version bump rather than left dirty in the working tree.
+promote_changelog
+assert_changelog_promoted
+
+# Step 3: Commit and tag
+step 3 "Commit and tag"
+
+if [ "$IS_CI" = "true" ]; then
+  info "CI mode -- skipping commit/tag/push (already tagged)"
+else
+  BUMP_FILES="package.json package-lock.json"
+  [ -f CHANGELOG.md ] && BUMP_FILES="$BUMP_FILES CHANGELOG.md"
+  [ -f server.json ] && BUMP_FILES="$BUMP_FILES server.json"
+  if [ -n "$(git status --porcelain $BUMP_FILES 2>/dev/null)" ]; then
+    git add $BUMP_FILES
+    git commit -m "v${VERSION}"
+    info "Committed version bump"
+  else
+    info "Already committed -- skipping"
+  fi
+
+  if git tag -l "v${VERSION}" | grep -q "v${VERSION}"; then
+    info "Tag v${VERSION} already exists -- skipping"
+  else
+    # Annotated (-a) so `git push --follow-tags` below picks it up;
+    # lightweight tags are ignored by --follow-tags and would silently
+    # fail to publish (release commit lands but tag-push is a no-op).
+    git tag -a "v${VERSION}" -m "v${VERSION}"
+    info "Tag v${VERSION} created"
+  fi
+
+  # Step 4: Push
+  step 4 "Push to origin"
+
+  # --follow-tags pushes only annotated tags reachable from the pushed
+  # commits, not every local tag. Avoids accidentally publishing dangling
+  # experimental tags that happen to be lying around.
+  # Tag-drift safety: refuse to push if origin already has a tag at this name
+  # pointing to a different commit (rewound tag elsewhere, parallel release race).
+  # Without this check, `git push --follow-tags` SILENTLY skips updating the
+  # tag on origin (the tag exists, no fast-forward happens). The main push
+  # reports success, but origin's tag stays at the old SHA -- and the later
+  # `gh release create` step then creates a GitHub release linked to that
+  # stale commit while npm carries the new one.
+  ORIGIN_TAG_SHA=$(git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | awk '{print $1}')
+  if [ -n "$ORIGIN_TAG_SHA" ]; then
+    LOCAL_TAG_SHA=$(git rev-parse "v${VERSION}")
+    if [ "$ORIGIN_TAG_SHA" != "$LOCAL_TAG_SHA" ]; then
+      fail "Tag v${VERSION} exists on origin at $ORIGIN_TAG_SHA but local tag points to $LOCAL_TAG_SHA -- resolve the drift before re-running"
+    fi
+  fi
+
+  git push origin main --follow-tags
+  info "Pushed commit and tag"
+fi
+
+# Step 5: Publish to npm
+# Three publish paths, picked by environment:
+#   1. IS_CI=true                    -> WE are CI. Do the publish (NODE_AUTH_TOKEN
+#                                       is set; --provenance for sigstore).
+#   2. IS_CI=false + release.yml     -> CI will publish on the tag we just pushed.
+#      exists with CI publish path      Watch `gh run watch` for that run and
+#                                       verify on npm. Workstation MUST
+#                                       NOT also publish -- stale ~/.npmrc fails
+#                                       E404, valid one races CI for the same
+#                                       version. CI is authoritative.
+#   3. IS_CI=false + no CI publish   -> Workstation IS the publisher. Try locally
+#      path                             with EOTP retry for fresh WebAuthn sessions.
+step 5 "Publish to npm"
+if npm_version_live; then NPM_VERSION="$VERSION"; else NPM_VERSION=""; fi
+if [ "$NPM_VERSION" = "$VERSION" ]; then
+  info "Already published to npm -- skipping"
+  # Resume-path safety: a prior interrupted run may have published but never
+  # observed `gh run watch` to completion. Later CI steps (smoke test, MCP
+  # Registry publish, attestation upload) could have failed silently. Look
+  # up the most recent Release run for this tag and warn if its conclusion
+  # was non-success. Best-effort -- if the tag isn't on origin yet or the
+  # run isn't visible, the warn just doesn't fire.
+  if [ "$IS_CI" != "true" ] && [ -f ".github/workflows/release.yml" ]; then
+    RESUME_TAG_SHA=$(git rev-parse "v${VERSION}^{}" 2>/dev/null || echo "")
+    if [ -n "$RESUME_TAG_SHA" ]; then
+      RESUME_CONCLUSION=$(gh run list --workflow=Release --event=push --commit="$RESUME_TAG_SHA" --limit=1 --json conclusion --jq '.[0].conclusion' 2>/dev/null || echo "")
+      if [ -n "$RESUME_CONCLUSION" ] && [ "$RESUME_CONCLUSION" != "success" ]; then
+        warn "Prior CI Release run for v${VERSION} ended with conclusion='$RESUME_CONCLUSION' (not 'success'). A post-publish step (smoke test, MCP Registry publish, attestation) may have failed silently. Inspect: gh run list --workflow=Release --commit=$RESUME_TAG_SHA --limit=3"
+      fi
+    fi
+  fi
+elif [ "$IS_CI" = "true" ]; then
+  npm publish --access public --provenance
+  info "Published @yawlabs/terraform-cwd-mcp@${VERSION} to npm (with provenance)"
+elif [ -f ".github/workflows/release.yml" ] && grep -q "npm publish\|NODE_AUTH_TOKEN" .github/workflows/release.yml; then
+  info "CI release.yml fires on v* tag push -- workstation hands off to CI"
+  # Verify the tag landed on origin BEFORE looking up the CI run. A local
+  # push that succeeded but the remote rejected (protected-tag rule, network
+  # blip) would otherwise dead-end in the lookup loop with a misleading
+  # "Push may have failed" error 62s later. ls-remote is one round-trip --
+  # cheap relative to gh run watch.
+  if ! git ls-remote --tags origin "refs/tags/v${VERSION}" 2>/dev/null | grep -q "refs/tags/v${VERSION}$"; then
+    fail "Tag v${VERSION} not visible on origin. Step 4's 'git push --follow-tags' may have failed silently (protected-tag rule, network blip), or the tag was deleted between push and now. Re-run step 4."
+  fi
+  TAG_SHA=$(git rev-parse "v${VERSION}^{}")
+  RUN_ID=""
+  # Exponential backoff: 2+4+8+16+32 = 62s upper bound on GitHub's
+  # tag-push -> actions queue visibility lag. Cheap relative to the CI run
+  # itself (~6 min on aws-mcp).
+  DELAY=2
+  for i in 1 2 3 4 5; do
+    RUN_ID=$(gh run list --workflow=Release --event=push --commit="$TAG_SHA" --limit=1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || echo "")
+    [ -n "$RUN_ID" ] && break
+    sleep $DELAY
+    DELAY=$((DELAY * 2))
+  done
+  if [ -z "$RUN_ID" ]; then
+    fail "Could not find Release workflow run for tag v${VERSION} (commit $TAG_SHA) after 62s of polling. The actions queue may be backed up; check 'gh run list --limit 5' and rerun the script to retry."
+  fi
+  info "Watching CI Release run $RUN_ID"
+  gh run watch "$RUN_ID" --exit-status || fail "CI Release run $RUN_ID failed. See 'gh run view $RUN_ID --log-failed'."
+  # CI is authoritative on the publish itself -- if `gh run watch` exited 0,
+  # the package is live on npm regardless of how long the registry mirror
+  # takes to surface it. Verification here is a courtesy check; warn rather
+  # than fail when the mirror lags (existing memory: lag can exceed a minute).
+  NPM_NOW=""
+  for i in $(seq 1 100); do
+    if npm_version_live; then NPM_NOW="$VERSION"; else NPM_NOW=""; fi
+    [ "$NPM_NOW" = "$VERSION" ] && break
+    sleep 6
+  done
+  if [ "$NPM_NOW" = "$VERSION" ]; then
+    info "Published @yawlabs/terraform-cwd-mcp@${VERSION} via CI Release run $RUN_ID"
+  else
+    DISPLAY_NPM="${NPM_NOW:-(not found)}"
+    warn "CI Release run $RUN_ID succeeded but npm registry still shows '$DISPLAY_NPM' for @yawlabs/terraform-cwd-mcp@${VERSION} after 600s. Likely registry propagation lag -- verify with 'curl -sI https://registry.npmjs.org/@yawlabs%2Fterraform-cwd-mcp/${VERSION}' in a minute. Publish is authoritative on CI's exit code."
+  fi
+else
+  # Workstation IS the publisher (no CI fallback). Retry only on EOTP/EAUTH/OTP
+  # for fresh WebAuthn sessions; npm's E403 "cannot publish over" means the
+  # version is already there; fail fast on everything else.
+  ATTEMPT=1
+  MAX_ATTEMPTS=3
+  NPM_ALREADY_THERE=false
+  while true; do
+    PUBLISH_LOG=$(mktemp)
+    if npm publish --access public 2>&1 | tee "$PUBLISH_LOG"; then
+      rm -f "$PUBLISH_LOG"
+      break
+    fi
+    # npm's own word that the version is already there: the E403 "You
+    # cannot publish over the previously published versions". Reachable
+    # when the skip check above missed a version npm holds -- its read
+    # path lagging the write, or this host unable to read it -- which is
+    # the state an immediate re-run after a failed later step starts from.
+    # Treated as the skip it should have been, not as a token problem.
+    if grep -q 'cannot publish over the previously published versions' "$PUBLISH_LOG"; then
+      rm -f "$PUBLISH_LOG"
+      NPM_ALREADY_THERE=true
+      break
+    fi
+    if ! grep -qE 'EOTP|EAUTH|one-time password|OTP' "$PUBLISH_LOG"; then
+      rm -f "$PUBLISH_LOG"
+      fail "npm publish failed (non-OTP error -- see output above).
+
+  If the error was E401 or E404, the automation token in ~/.npmrc is dead.
+  npm answers an UNAUTHORIZED PUT with 404, not 401, so 'could not be found
+  or you do not have permission' here almost always means 'not authorized'
+  -- the package is fine. Confirm which it is:
+
+      npm whoami          # E401 => the token is dead
+
+  Fix: mint a NEW automation token (npmjs.com -> Access Tokens -> Generate
+  -> Automation), then write these two lines to ~/.npmrc:
+
+      @yawlabs:registry=https://registry.npmjs.org/
+      //registry.npmjs.org/:_authToken=npm_YOURTOKEN
+
+  Do NOT run 'npm login --auth-type=web'. It OVERWRITES the automation token
+  with a 2FA-bound web session; the next publish then EOTPs on a WebAuthn
+  challenge, and any CI sharing that token starts failing too."
+    fi
+    rm -f "$PUBLISH_LOG"
+    if [ $ATTEMPT -ge $MAX_ATTEMPTS ]; then
+      fail "npm publish failed after $MAX_ATTEMPTS OTP-class attempts. WebAuthn session may not be propagating."
+    fi
+    warn "npm publish attempt $ATTEMPT EOTPed -- waiting 30s for WebAuthn session to propagate"
+    ATTEMPT=$((ATTEMPT + 1))
+    sleep 30
+  done
+  if [ "$NPM_ALREADY_THERE" = "true" ]; then
+    warn "npm already holds @yawlabs/terraform-cwd-mcp@${VERSION} (its E403 said so) though the pre-publish read did not show it -- treating the publish as done"
+  else
+    info "Published @yawlabs/terraform-cwd-mcp@${VERSION} to npm (workstation)"
+  fi
+fi
+
+# Step 6: Create GitHub release
+step 6 "Create GitHub release"
+
+if gh release view "v${VERSION}" >/dev/null 2>&1; then
+  info "GitHub release v${VERSION} already exists -- skipping"
+else
+  PREV_TAG=$(git tag --sort=-v:refname | grep -A1 "^v${VERSION}$" | tail -1)
+  NOTES=$(release_notes "$PREV_TAG")
+
+  # --notes-file, not --notes: the body is a whole CHANGELOG section, and
+  # passing that as a command-line ARGUMENT exceeds the ~32kB CreateProcess
+  # limit on Windows -- `gh: Argument list too long`, exit 126. That killed
+  # step 6 of tailscale-mcp's v0.21.0 release AFTER npm had published, and
+  # mcp-compliance hit it at 62kB. A file has no such limit anywhere.
+  NOTES_FILE=$(mktemp)
+  printf '%s\n' "$NOTES" > "$NOTES_FILE"
+  gh release create "v${VERSION}" \
+    --title "v${VERSION}" \
+    --notes-file "$NOTES_FILE"
+  rm -f "$NOTES_FILE"
+  info "GitHub release created (notes from CHANGELOG.md [${VERSION}])"
+fi
+
+# --- npm propagation gate (part of step 7, deliberately not a step of its own) ---
+#
+# `npm publish` returns as soon as the registry ACCEPTS the tarball, but the
+# version is not immediately readable from the CDN-backed read path. The MCP
+# Registry validates by READING the package, so a registry publish that runs
+# straight after `npm publish` can fail with "version 'X' was not found
+# (status: 404)". ssh-mcp v0.15.3 failed exactly that way, and aws-mcp did on
+# three consecutive releases (2.2.0, 2.2.1, 2.2.2). Each recovered only by
+# waiting and re-running, i.e. the release cost two invocations and a human
+# in the loop.
+#
+# Polling here makes one invocation enough (ported from aws-mcp's release.sh).
+# Three deliberate choices:
+#
+#   * npm_version_live (curl), not `npm view`. `npm view` reads the whole
+#     packument, which Cloudflare's edge caches for up to 5 min, so a poll
+#     through it can keep reporting the pre-publish answer well after the
+#     version is live -- the loop would then outlast the condition it is waiting
+#     on.
+#   * The MCP Registry's exact path. Its npm validator requests
+#     <base>/url.PathEscape(name)/<version>, and Go's PathEscape turns the scope
+#     slash into %2F (`@yawlabs%2Fpkg`, the `@` left bare). A literal-slash URL
+#     reaches the same origin but can be a different CDN cache entry, so success
+#     there would be a proxy rather than evidence about the path that fails. The
+#     helper's `_` cache-buster also changes the full URL. That is harmless
+#     while npm serves this document uncached (CF-Cache-Status DYNAMIC). If npm
+#     ever caches it, this gate could go green before the registry's own read
+#     does, and step 7's retry covers that gap.
+#   * WARN, never fail, on timeout. If propagation is genuinely stuck, letting
+#     mcp-publisher run produces its own precise error naming the version and
+#     status; a timeout message from this loop would replace that with something
+#     strictly less informative. This gate can only make the release faster,
+#     never worse than it was before it existed.
+if [ "${SKIP_NPM_WAIT:-}" = "1" ]; then
+  warn "SKIP_NPM_WAIT=1 -- not waiting for npm to serve v${VERSION}"
+elif ! command -v curl >/dev/null 2>&1; then
+  warn "curl not found -- skipping the npm propagation wait; step 7 may 404 on a fresh publish"
+else
+  PKG_NAME=$(node -p "require('./package.json').name")
+  # 600 s: the @yawlabs/fetch-mcp 0.8.2 release (2026-09-29) spent 295 s of
+  # the 300 s this used to be waiting for npm to serve its new version.
+  NPM_WAIT_TIMEOUT_S=${NPM_WAIT_TIMEOUT_S:-600}
+  NPM_WAITED_S=0
+  # 5s: this is a remote read on a minutes-scale wait, so a tighter spin buys
+  # nothing. (Under MSYS every `sleep` forks a process -- ~0.1s each -- which is
+  # noise at this interval but the reason not to poll sub-second.)
+  while [ "$NPM_WAITED_S" -lt "$NPM_WAIT_TIMEOUT_S" ]; do
+    if npm_version_live; then
+      break
+    fi
+    sleep 5
+    NPM_WAITED_S=$((NPM_WAITED_S + 5))
+  done
+  if [ "$NPM_WAITED_S" -ge "$NPM_WAIT_TIMEOUT_S" ]; then
+    warn "npm still does not serve ${PKG_NAME}@${VERSION} after ${NPM_WAIT_TIMEOUT_S}s -- continuing anyway so the registry step can report the precise error"
+  elif [ "$NPM_WAITED_S" -gt 0 ]; then
+    info "npm is serving v${VERSION} (waited ${NPM_WAITED_S}s for propagation)"
+  else
+    info "npm is already serving v${VERSION}"
+  fi
+fi
+
+# =============================================================================
+# Step 7: Publish to the Official MCP Registry
+# =============================================================================
+# Downstream catalogs (Glama, PulseMCP, mcpservers.org) auto-source from the
+# Official MCP Registry; publishing here is what makes the new version visible
+# to them. server.json was already bumped in step 2 so the version matches the
+# tag.
+# mcp_bounded <command...>: run one mcp-publisher call -- a login or a publish
+# -- with a time limit, so a registry that never answers cannot hang the
+# release. mcp-publisher sends with a bare Go http.Client: Go's default
+# transport gives up on a dial after 30 s and on a TLS handshake after 10 s,
+# but waits for the answer with no limit at all. The limit here is
+# MCP_PUBLISH_TIMEOUT_S seconds (default 90; 0 turns it off), then TERM, then
+# KILL MCP_PUBLISH_KILL_AFTER_S seconds later (default 10; at least 1, since
+# timeout(1) reads 0 as never), through coreutils timeout(1). --foreground
+# keeps mcp-publisher in the terminal's process group, so Ctrl-C still reaches
+# it. Git Bash and most glibc distributions ship GNU timeout, Ubuntu 26.04 LTS
+# ships uutils' compatible one (its banner also says coreutils), and macOS
+# gets it as gtimeout from Homebrew coreutils. BusyBox (Alpine) and Windows'
+# own timeout.exe are different programs, which is why the version banner is
+# checked. Without a coreutils timeout the call runs unbounded, and a warning
+# says so. A call the limit stopped exits 124 -- or 137 when the KILL was
+# needed, on newer coreutils such as GNU 9.4 (Git Bash's 8.32 exits 124 even
+# then) -- prints a line on stderr saying so, and sets MCP_BOUNDED_STOPPED.
+mcp_timeout_setup() {
+  MCP_TIMEOUT_READY=1
+  MCP_PUBLISH_TIMEOUT_S="${MCP_PUBLISH_TIMEOUT_S:-90}"
+  case "$MCP_PUBLISH_TIMEOUT_S" in
+    '' | *[!0-9]*)
+      warn "MCP_PUBLISH_TIMEOUT_S='${MCP_PUBLISH_TIMEOUT_S}' is not whole seconds -- using 90" >&2
+      MCP_PUBLISH_TIMEOUT_S=90
+      ;;
+  esac
+  local kill_after="${MCP_PUBLISH_KILL_AFTER_S:-10}"
+  case "$kill_after" in
+    '' | *[!0-9]*) kill_after=0 ;;
+  esac
+  if [ "$kill_after" -eq 0 ]; then
+    warn "MCP_PUBLISH_KILL_AFTER_S='${MCP_PUBLISH_KILL_AFTER_S}' is not whole seconds above 0 -- using 10" >&2
+    kill_after=10
+  fi
+  MCP_PUBLISH_KILL_AFTER_S="$kill_after"
+  MCP_TIMEOUT_BIN=""
+  local t
+  for t in timeout gtimeout; do
+    command -v "$t" >/dev/null 2>&1 || continue
+    case "$("$t" --version 2>/dev/null || true)" in
+      *coreutils*)
+        MCP_TIMEOUT_BIN="$t"
+        break
+        ;;
+    esac
+  done
+  if [ -z "$MCP_TIMEOUT_BIN" ]; then
+    warn "Neither timeout nor gtimeout on PATH is the coreutils one -- a registry that never answers would hang the MCP Registry step" >&2
+  fi
+}
+mcp_bounded() {
+  [ -n "${MCP_TIMEOUT_READY:-}" ] || mcp_timeout_setup
+  MCP_BOUNDED_STOPPED=""
+  if [ -z "$MCP_TIMEOUT_BIN" ]; then
+    "$@"
+    return
+  fi
+  local rc=0
+  "$MCP_TIMEOUT_BIN" --foreground -k "$MCP_PUBLISH_KILL_AFTER_S" "$MCP_PUBLISH_TIMEOUT_S" "$@" || rc=$?
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    MCP_BOUNDED_STOPPED=1
+    echo "mcp-publisher did not answer within ${MCP_PUBLISH_TIMEOUT_S}s -- stopped it" >&2
+  fi
+  return "$rc"
+}
+# mcp_login_fail <message>: fail on a login that did not go through, with
+# <message> -- unless the time limit stopped it. That is the registry not
+# answering, not a bad credential, and the failure says so instead.
+mcp_login_fail() {
+  if [ -n "${MCP_BOUNDED_STOPPED:-}" ]; then
+    fail "The MCP Registry did not answer the mcp-publisher login within ${MCP_PUBLISH_TIMEOUT_S}s -- npm + GitHub release succeeded, but the MCP Registry step did not. Retry the step (re-run the script) once the registry answers."
+  fi
+  fail "$1"
+}
+# The first mcp_bounded call sets the limit up; a value inherited from the
+# environment must not stand in for that.
+MCP_TIMEOUT_READY=""
+
+step 7 "Publish to MCP Registry"
+
+if [ ! -f server.json ]; then
+  info "No server.json -- not an MCP server, skipping registry publish"
+else
+  # mcp-publisher binary cached at ~/.local/bin. Pinned to "latest" upstream;
+  # if the registry's CLI introduces a breaking change, the next release will
+  # surface it. The OS/arch detection handles Linux, macOS, and Git Bash on
+  # Windows (MINGW/MSYS uname -s starts with "mingw" / "msys").
+  MP="${MCP_PUBLISHER:-$HOME/.local/bin/mcp-publisher}"
+  if ! [ -x "$MP" ]; then
+    info "mcp-publisher not found at $MP -- downloading"
+    mkdir -p "$(dirname "$MP")"
+    OS_RAW=$(uname -s | tr '[:upper:]' '[:lower:]')
+    case "$OS_RAW" in mingw*|msys*|cygwin*) OS=windows ;; *) OS="$OS_RAW" ;; esac
+    ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+    TMP=$(mktemp -d)
+    curl -sL -o "$TMP/mp.tar.gz" \
+      "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_${OS}_${ARCH}.tar.gz" \
+      || fail "Failed to download mcp-publisher (${OS}/${ARCH})"
+    tar xzf "$TMP/mp.tar.gz" -C "$TMP" || fail "Failed to extract mcp-publisher tarball"
+    if [ -f "$TMP/mcp-publisher.exe" ]; then
+      mv "$TMP/mcp-publisher.exe" "$MP"
+    else
+      mv "$TMP/mcp-publisher" "$MP"
+    fi
+    rm -rf "$TMP"
+    chmod +x "$MP" 2>/dev/null || true
+  fi
+
+  # OIDC auth (used by the old release.yml) only works inside Actions; locally
+  # we use a GitHub PAT via `login github -token <PAT>`. At login the registry
+  # reads the org roles this token can see, and grants io.github.YawLabs/* only
+  # to a YawLabs org Owner (read:org lets it read them; so do repo, user,
+  # write:org and admin:org). It enforces the grant only at publish: a token
+  # that cannot read the roles still logs in, and the publish gets a 403.
+  # Fall back to gh CLI's session token if MCP_REGISTRY_TOKEN is unset --
+  # gh auth login (admin:org or read:org scope) covers the namespace claim.
+  : "${MCP_REGISTRY_TOKEN:=$(gh auth token 2>/dev/null || true)}"
+  if [ -z "${MCP_REGISTRY_TOKEN:-}" ]; then
+    fail "MCP_REGISTRY_TOKEN unset -- set it to a GitHub PAT with read:org for YawLabs (or run '$MP login github' once interactively to cache the session)."
+  fi
+  mcp_bounded "$MP" login github -token "$MCP_REGISTRY_TOKEN" >/dev/null \
+    || mcp_login_fail "mcp-publisher login failed -- its output is above. A 401 there is the registry refusing the token exchange: most often MCP_REGISTRY_TOKEN, or the gh CLI token it fell back to, is invalid or expired, though the registry answers 401 when GitHub's own API fails too. A 429, a 5xx or a connection error is the registry or the network. npm + GitHub release succeeded: retry the step (re-run the script) once the cause is fixed."
+  # Up to four attempts, 30 s, 60 s, then 90 s apart, and ONLY for the
+  # shape waiting cures. The npm gate above reads npm from THIS machine's
+  # CDN edge, so it can go green while the MCP Registry's own read still
+  # lags (ctxlint v0.27.0 needed the 3rd of 3 retries, ~150 s after the
+  # publish). The live registry (v1.8.1; wording from registry PR #1411)
+  # answers that lag with "exists, but version '<v>' was not found
+  # (status: 404)", and a bad moment on npm's side with "... Likely
+  # transient, retry later" (429, 5xx, an inconclusive 404) or "failed to
+  # fetch package metadata from NPM" (no status at all). Every other
+  # failure -- bad server.json, namespace not owned, auth -- fails the same
+  # after any wait, so it stops on the first attempt,
+  # the retried cases here and below aside. A duplicate version means an
+  # earlier run, or an earlier attempt of this run, already registered it:
+  # the state this step wants.
+  # The not-found match needs the validator's own "version '<v>'", not the
+  # bare version: mcp-publisher from registry main prints "Publishing
+  # <name>@<version> to ..." before any error, which would let the
+  # package-missing 404 (no version in it) buy the waits.
+  # The registry's OWN transient answers are retried on the same clock too:
+  # HTTP 429, 502, 503 or 504 on the publish call. Cutting @yawlabs/mcp 1.0.17
+  # (2026-09-29) met a 504 from the registry's nginx gateway while its search
+  # requests were timing out -- the registry was slow, not saying no. A retry
+  # is safe even when the timed-out attempt landed: it then meets the
+  # duplicate-version branch below.
+  # An attempt that gets no answer at all is retried on the same clock:
+  # mcp_bounded (above) stops one the registry never answers, and the client
+  # reports a connection that drops before or while answering as "error
+  # sending request" or "error reading response". The request may have landed
+  # then, so a duplicate on the retry means it did. A connection the client
+  # reports as never opened -- a dial, DNS, proxy or certificate error, a TLS
+  # handshake that timed out, a proxy that refused the tunnel -- is retried as
+  # well, but cannot have landed, and neither can an attempt the registry
+  # refused with a 429. A handshake the far end cut off reads like any other
+  # drop (EOF, a reset), and is treated as one.
+  MCP_PUBLISH_LOG=$(mktemp)
+  MCP_DONE=false
+  MCP_ATTEMPT=1
+  MCP_MAX_ATTEMPTS=4
+  MCP_GATEWAY_RETRIED=false
+  # Already set up by the first login above; repeated here as a no-op so the
+  # checks after the pipeline never depend on that login having run: the
+  # attempt below runs in a pipeline's subshell, which cannot set it for them.
+  [ -n "${MCP_TIMEOUT_READY:-}" ] || mcp_timeout_setup
+  while true; do
+    # `|| MCP_PUBLISH_RC=$?` rather than `if`: the exit code is what tells an
+    # attempt the limit stopped (124, or 137 where the KILL was needed) from
+    # the rest, and under pipefail it is the publisher's, not tee's.
+    MCP_PUBLISH_RC=0
+    mcp_bounded "$MP" publish 2>&1 | tee "$MCP_PUBLISH_LOG" || MCP_PUBLISH_RC=$?
+    if [ "$MCP_PUBLISH_RC" -eq 0 ]; then
+      MCP_DONE=true
+      break
+    fi
+    if grep -qiE 'duplicate version|already exists' "$MCP_PUBLISH_LOG"; then
+      if [ "$MCP_GATEWAY_RETRIED" = "true" ]; then
+        info "MCP Registry refused the retry of ${VERSION} as a duplicate: an attempt of this run that got no clear answer landed"
+      else
+        info "MCP Registry already has ${VERSION} -- nothing to publish"
+      fi
+      MCP_DONE=true
+      break
+    fi
+    # The registry's own 429/502/503/504 on the publish call, if that is what
+    # this attempt got: empty otherwise. `|| true` because no match is the
+    # normal case, and the failing grep would then make the assignment fail,
+    # which `set -e` turns into the end of the script.
+    MCP_GATEWAY_STATUS=$(grep -oE 'server returned status (429|502|503|504)([^0-9]|$)' "$MCP_PUBLISH_LOG" | head -n 1 | grep -oE '[0-9]{3}' || true)
+    # No answer at all, if that is what this attempt got: empty otherwise. A
+    # proxy that refuses the tunnel leaves only the rest of its status line
+    # right after the quoted URL: a reason phrase that starts with a capital
+    # (Go's own errors there start lower case, or are EOF), nothing at all, or
+    # "unknown status code" when the line stops at the code. Matching it right
+    # after the URL keeps bytes a server echoes back inside Go's own quoted
+    # error text from passing for one. A refusal of any other shape reads as a
+    # drop, which changes only how a later duplicate is reported.
+    MCP_NO_ANSWER=""
+    MCP_MAY_HAVE_LANDED=false
+    if [ -n "${MCP_TIMEOUT_BIN:-}" ] && { [ "$MCP_PUBLISH_RC" -eq 124 ] || [ "$MCP_PUBLISH_RC" -eq 137 ]; }; then
+      MCP_NO_ANSWER="did not answer within ${MCP_PUBLISH_TIMEOUT_S}s"
+      MCP_MAY_HAVE_LANDED=true
+    elif grep -q 'error sending request' "$MCP_PUBLISH_LOG" \
+      && grep -qE 'dial tcp|proxyconnect|tls:|x509:|TLS handshake timeout|error sending request: [A-Z][a-z]+ "[^"]*": ( *|unknown status code|[A-Z]([a-z]|[A-Z]+[ a-z(-]).*)$' "$MCP_PUBLISH_LOG"; then
+      MCP_NO_ANSWER="could not be reached"
+    elif grep -qE 'error sending request|error reading response' "$MCP_PUBLISH_LOG"; then
+      MCP_NO_ANSWER="dropped the connection without an answer"
+      MCP_MAY_HAVE_LANDED=true
+    fi
+    if ! { { grep -qE 'not found \(status: *[0-9]+\)' "$MCP_PUBLISH_LOG" && grep -qF "version '${VERSION}'" "$MCP_PUBLISH_LOG"; } \
+        || grep -qE 'Likely transient, retry later|failed to fetch package metadata from NPM' "$MCP_PUBLISH_LOG" \
+        || [ -n "$MCP_GATEWAY_STATUS" ] \
+        || [ -n "$MCP_NO_ANSWER" ]; }; then
+      break
+    fi
+    if [ "$MCP_ATTEMPT" -ge "$MCP_MAX_ATTEMPTS" ]; then break; fi
+    MCP_WAIT=$((MCP_ATTEMPT * 30))
+    if [ -n "$MCP_GATEWAY_STATUS" ]; then
+      # A 502-504 can come after the attempt landed; a 429 refused it.
+      if [ "$MCP_GATEWAY_STATUS" != 429 ]; then MCP_GATEWAY_RETRIED=true; fi
+      warn "MCP Registry answered HTTP ${MCP_GATEWAY_STATUS} itself -- busy or timing out, not a verdict -- waiting ${MCP_WAIT}s, then attempt $((MCP_ATTEMPT + 1)) of ${MCP_MAX_ATTEMPTS}"
+    elif [ -n "$MCP_NO_ANSWER" ]; then
+      if [ "$MCP_MAY_HAVE_LANDED" = true ]; then MCP_GATEWAY_RETRIED=true; fi
+      warn "MCP Registry ${MCP_NO_ANSWER} -- waiting ${MCP_WAIT}s, then attempt $((MCP_ATTEMPT + 1)) of ${MCP_MAX_ATTEMPTS}"
+    else
+      warn "MCP Registry cannot see @yawlabs/terraform-cwd-mcp@${VERSION} on npm yet -- waiting ${MCP_WAIT}s, then attempt $((MCP_ATTEMPT + 1)) of ${MCP_MAX_ATTEMPTS}"
+    fi
+    sleep "$MCP_WAIT"
+    # A fresh registry token before every retry: tokens last 5 minutes, and an
+    # attempt that meets a timing-out gateway spends the gateway's own timeout
+    # before its 504 arrives, so the waits plus four slow attempts can outlast
+    # the token the login above issued -- and an expired token is a 401 that
+    # fails the step.
+    mcp_bounded "$MP" login github -token "${MCP_REGISTRY_TOKEN:-}" >/dev/null \
+      || warn "mcp-publisher login refresh failed -- the next attempt may be refused as unauthorized"
+    MCP_ATTEMPT=$((MCP_ATTEMPT + 1))
+  done
+  # The registry decides the namespace grant at login, from the org roles the
+  # token can read, but enforces it only at publish: a token that cannot read
+  # YawLabs org roles, or whose owner is not a YawLabs org Owner, logs in fine
+  # and is refused here with a 403.
+  MCP_REFUSED_NAMESPACE=false
+  if grep -q 'server returned status 403' "$MCP_PUBLISH_LOG"; then MCP_REFUSED_NAMESPACE=true; fi
+  rm -f "$MCP_PUBLISH_LOG"
+  if [ "$MCP_DONE" = "true" ]; then
+    info "Published to MCP Registry"
+  else
+    if [ "$MCP_REFUSED_NAMESPACE" = true ]; then
+      warn "A 403 on publish is the registry refusing the io.github.YawLabs namespace. It grants that namespace only to a YawLabs org Owner whose token can read org roles: a classic PAT with the repo, user, read:org, write:org or admin:org scope, or a fine-grained PAT with read access to the organization's Members. The membership does not have to be public, whatever the registry's own message says."
+    fi
+    fail "mcp-publisher publish failed -- npm + GitHub release succeeded, but the MCP Registry did not. Retry the step (re-run the script) once the cause is identified."
+  fi
+fi
+
+# Step 8: Verify
+step 8 "Verify"
+
+# Poll up to 120 times 5s apart (about 600s of sleeps, plus each read) rather
+# than read once after 3s: the @yawlabs/fetch-mcp 0.8.2 release (2026-09-29)
+# spent 295 s of its 300 s gate waiting for npm to serve its new version, and
+# the npm gate before the MCP Registry step only warns when it runs out.
+LIVE_VERSION=""
+for i in $(seq 1 120); do
+  if npm_version_live; then LIVE_VERSION="$VERSION"; break; fi
+  if [ "$i" -lt 120 ]; then sleep 5; fi
+done
+if [ "$LIVE_VERSION" = "$VERSION" ]; then
+  info "npm: @yawlabs/terraform-cwd-mcp@${LIVE_VERSION}"
+else
+  warn "npm: ${LIVE_VERSION} (expected ${VERSION} -- may still be propagating)"
+fi
+
+GH_TAG=$(gh release view "v${VERSION}" --json tagName --jq '.tagName' 2>/dev/null || echo "")
+if [ "$GH_TAG" = "v${VERSION}" ]; then
+  info "GitHub release: ${GH_TAG}"
+else
+  warn "GitHub release: not found"
+fi
+
+# Provenance attestation -- npm attaches sigstore attestations when
+# `npm publish --provenance` runs inside GitHub Actions (the CI path).
+# Missing attestation in CI means something regressed; in local mode it is expected.
+if [ "$IS_CI" = "true" ]; then
+  ATTEST=$(npm view "@yawlabs/terraform-cwd-mcp@${VERSION}" dist.attestations.provenance.predicateType 2>/dev/null || echo "")
+  if [ -n "$ATTEST" ]; then
+    info "provenance attestation: $ATTEST"
+  else
+    warn "no provenance attestation found on v${VERSION} (expected in CI publish)"
+  fi
+fi
+
+echo ""
+echo -e "${GREEN}v${VERSION} released successfully!${NC}"
+echo -e "${GREEN}  install: npm i @yawlabs/terraform-cwd-mcp@${VERSION}${NC}"
+echo ""

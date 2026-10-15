@@ -1,0 +1,121 @@
+{
+  "format_version": "1.0",
+  "provider_schemas": {
+    "registry.terraform.io/hashicorp/kubernetes": {
+      "provider": {
+        "version": 0,
+        "block": {
+          "attributes": {
+            "client_certificate": {
+              "type": "string",
+              "description": "PEM-encoded client certificate for TLS authentication.",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "client_key": {
+              "type": "string",
+              "description": "PEM-encoded client certificate key for TLS authentication.",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "cluster_ca_certificate": {
+              "type": "string",
+              "description": "PEM-encoded root certificates bundle for TLS authentication.",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "config_context": {
+              "type": "string",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "config_context_auth_info": {
+              "type": "string",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "config_context_cluster": {
+              "type": "string",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "config_path": {
+              "type": "string",
+              "description": "Path to the kube config file. Can be set with KUBE_CONFIG_PATH.",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "config_paths": {
+              "type": ["list", "string"],
+              "description": "A list of paths to kube config files. Can be set with KUBE_CONFIG_PATHS environment variable.",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "host": {
+              "type": "string",
+              "description": "The hostname (in form of URI) of Kubernetes master.",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "insecure": {
+              "type": "bool",
+              "description": "Whether server should be accessed without verifying the TLS certificate.",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "password": {
+              "type": "string",
+              "description": "The password to use for HTTP basic authentication when accessing the Kubernetes master endpoint.",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "token": {
+              "type": "string",
+              "description": "Token to authenticate an service account",
+              "description_kind": "plain",
+              "optional": true
+            },
+            "username": {
+              "type": "string",
+              "description": "The username to use for HTTP basic authentication when accessing the Kubernetes master endpoint.",
+              "description_kind": "plain",
+              "optional": true
+            }
+          },
+          "block_types": {
+            "exec": {
+              "nesting_mode": "list",
+              "block": {
+                "attributes": {
+                  "api_version": {
+                    "type": "string",
+                    "description_kind": "plain",
+                    "required": true
+                  },
+                  "args": {
+                    "type": ["list", "string"],
+                    "description_kind": "plain",
+                    "optional": true
+                  },
+                  "command": {
+                    "type": "string",
+                    "description_kind": "plain",
+                    "required": true
+                  },
+                  "env": {
+                    "type": ["map", "string"],
+                    "description_kind": "plain",
+                    "optional": true
+                  }
+                },
+                "description_kind": "plain"
+              },
+              "max_items": 1
+            }
+          },
+          "description_kind": "plain"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,5 @@
+Error loading the state: HTTP remote state endpoint requires auth
+
+Please ensure that your Terraform state exists and that you've
+configured it properly. You can use the "-state" flag to point
+Terraform at another state file.

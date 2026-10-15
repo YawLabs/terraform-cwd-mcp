@@ -1,0 +1,12 @@
+{
+  "Modules": [
+    { "Key": "", "Source": "", "Dir": "." },
+    {
+      "Key": "label",
+      "Source": "registry.terraform.io/cloudposse/label/null",
+      "Version": "0.25.0",
+      "Dir": ".terraform/modules/label"
+    },
+    { "Key": "naming", "Source": "./modules/naming", "Dir": "modules/naming" }
+  ]
+}

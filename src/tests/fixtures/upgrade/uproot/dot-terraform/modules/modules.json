@@ -1,0 +1,6 @@
+{
+  "Modules": [
+    { "Key": "", "Source": "", "Dir": "." },
+    { "Key": "certs", "Source": "./modules/certs", "Dir": "modules/certs" }
+  ]
+}

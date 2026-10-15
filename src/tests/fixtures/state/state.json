@@ -1,0 +1,496 @@
+{
+  "format_version": "1.0",
+  "terraform_version": "1.15.7",
+  "values": {
+    "outputs": {
+      "label_id": {
+        "sensitive": false,
+        "value": "eg-app",
+        "type": "string"
+      },
+      "new_out": {
+        "sensitive": false,
+        "value": "added",
+        "type": "string"
+      },
+      "pet": {
+        "sensitive": false,
+        "value": "delicate-pangolin",
+        "type": "string"
+      },
+      "pw": {
+        "sensitive": true,
+        "value": "FIXTURE-SECRET-13",
+        "type": "string"
+      }
+    },
+    "root_module": {
+      "resources": [
+        {
+          "address": "data.local_sensitive_file.read",
+          "mode": "data",
+          "type": "local_sensitive_file",
+          "name": "read",
+          "provider_name": "registry.terraform.io/hashicorp/local",
+          "schema_version": 0,
+          "values": {
+            "content": "FIXTURE-SECRET-13",
+            "content_base64": "FIXTURE-SECRET-14",
+            "content_base64sha256": "ZEwlmpKlZ3DSIJnvAMAVECyTmBKW1KgpCgc2rGthjyk=",
+            "content_base64sha512": "xX/6oYR18QFFAkhepPpRDIYHYJusGp3+NxbI5CAXZcrTt/yBVwaDkRe6PJlZZgDPaZf5V0tR9oxacmu+vbAKdA==",
+            "content_md5": "0d2bd8a56bae2f667d51af927086d436",
+            "content_sha1": "c69074d7fe6bc8b5bf73a79d12ccc9e860f13e19",
+            "content_sha256": "644c259a92a56770d22099ef00c015102c93981296d4a8290a0736ac6b618f29",
+            "content_sha512": "c57ffaa18475f1014502485ea4fa510c8607609bac1a9dfe3716c8e4201765cad3b7fc815706839117ba3c99596600cf6997f9574b51f68c5a726bbebdb00a74",
+            "filename": "./out/secret.txt",
+            "id": "c69074d7fe6bc8b5bf73a79d12ccc9e860f13e19"
+          },
+          "sensitive_values": {
+            "content": true,
+            "content_base64": true
+          }
+        },
+        {
+          "address": "local_file.drift",
+          "mode": "managed",
+          "type": "local_file",
+          "name": "drift",
+          "provider_name": "registry.terraform.io/hashicorp/local",
+          "schema_version": 0,
+          "values": {
+            "content": "hello",
+            "content_base64": null,
+            "content_base64sha256": "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=",
+            "content_base64sha512": "m3HSJL1i83hdltRq0+o9czGb+8KJDKra4t/3JRlnPKcjI8PZm6XBHXx6zG4UuMXaDEZjR1wuXDre9G9zvN7AQw==",
+            "content_md5": "5d41402abc4b2a76b9719d911017c592",
+            "content_sha1": "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+            "content_sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "content_sha512": "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca72323c3d99ba5c11d7c7acc6e14b8c5da0c4663475c2e5c3adef46f73bcdec043",
+            "directory_permission": "0777",
+            "file_permission": "0777",
+            "filename": "./out/drift.txt",
+            "id": "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d",
+            "sensitive_content": null,
+            "source": null
+          },
+          "sensitive_values": {
+            "sensitive_content": true
+          }
+        },
+        {
+          "address": "local_sensitive_file.sf",
+          "mode": "managed",
+          "type": "local_sensitive_file",
+          "name": "sf",
+          "provider_name": "registry.terraform.io/hashicorp/local",
+          "schema_version": 0,
+          "values": {
+            "content": "FIXTURE-SECRET-13",
+            "content_base64": null,
+            "content_base64sha256": "ZEwlmpKlZ3DSIJnvAMAVECyTmBKW1KgpCgc2rGthjyk=",
+            "content_base64sha512": "xX/6oYR18QFFAkhepPpRDIYHYJusGp3+NxbI5CAXZcrTt/yBVwaDkRe6PJlZZgDPaZf5V0tR9oxacmu+vbAKdA==",
+            "content_md5": "0d2bd8a56bae2f667d51af927086d436",
+            "content_sha1": "c69074d7fe6bc8b5bf73a79d12ccc9e860f13e19",
+            "content_sha256": "644c259a92a56770d22099ef00c015102c93981296d4a8290a0736ac6b618f29",
+            "content_sha512": "c57ffaa18475f1014502485ea4fa510c8607609bac1a9dfe3716c8e4201765cad3b7fc815706839117ba3c99596600cf6997f9574b51f68c5a726bbebdb00a74",
+            "directory_permission": "0700",
+            "file_permission": "0700",
+            "filename": "./out/secret.txt",
+            "id": "c69074d7fe6bc8b5bf73a79d12ccc9e860f13e19",
+            "source": null
+          },
+          "sensitive_values": {
+            "content": true,
+            "content_base64": true
+          },
+          "depends_on": ["random_password.db"]
+        },
+        {
+          "address": "random_id.imp",
+          "mode": "managed",
+          "type": "random_id",
+          "name": "imp",
+          "provider_name": "registry.terraform.io/hashicorp/random",
+          "schema_version": 0,
+          "values": {
+            "b64_std": "p+9hUg==",
+            "b64_url": "p-9hUg",
+            "byte_length": 4,
+            "dec": "2817483090",
+            "hex": "a7ef6152",
+            "id": "p-9hUg",
+            "keepers": null,
+            "prefix": null
+          },
+          "sensitive_values": {}
+        },
+        {
+          "address": "random_integer.n[0]",
+          "mode": "managed",
+          "type": "random_integer",
+          "name": "n",
+          "index": 0,
+          "provider_name": "registry.terraform.io/hashicorp/random",
+          "schema_version": 0,
+          "values": {
+            "id": "95",
+            "keepers": null,
+            "max": 100,
+            "min": 1,
+            "result": 95,
+            "seed": null
+          },
+          "sensitive_values": {}
+        },
+        {
+          "address": "random_integer.n[1]",
+          "mode": "managed",
+          "type": "random_integer",
+          "name": "n",
+          "index": 1,
+          "provider_name": "registry.terraform.io/hashicorp/random",
+          "schema_version": 0,
+          "values": {
+            "id": "11",
+            "keepers": null,
+            "max": 100,
+            "min": 1,
+            "result": 11,
+            "seed": null
+          },
+          "sensitive_values": {}
+        },
+        {
+          "address": "random_password.db",
+          "mode": "managed",
+          "type": "random_password",
+          "name": "db",
+          "provider_name": "registry.terraform.io/hashicorp/random",
+          "schema_version": 3,
+          "values": {
+            "bcrypt_hash": "FIXTURE-SECRET-01",
+            "id": "none",
+            "keepers": {
+              "rotation": "1"
+            },
+            "length": 20,
+            "lower": true,
+            "min_lower": 0,
+            "min_numeric": 0,
+            "min_special": 0,
+            "min_upper": 0,
+            "number": true,
+            "numeric": true,
+            "override_special": null,
+            "result": "FIXTURE-SECRET-13",
+            "special": true,
+            "upper": true
+          },
+          "sensitive_values": {
+            "bcrypt_hash": true,
+            "keepers": {},
+            "result": true
+          }
+        },
+        {
+          "address": "random_password.per_env[\"dev\"]",
+          "mode": "managed",
+          "type": "random_password",
+          "name": "per_env",
+          "index": "dev",
+          "provider_name": "registry.terraform.io/hashicorp/random",
+          "schema_version": 3,
+          "values": {
+            "bcrypt_hash": "FIXTURE-SECRET-03",
+            "id": "none",
+            "keepers": null,
+            "length": 10,
+            "lower": true,
+            "min_lower": 0,
+            "min_numeric": 0,
+            "min_special": 0,
+            "min_upper": 0,
+            "number": true,
+            "numeric": true,
+            "override_special": null,
+            "result": "FIXTURE-SECRET-16",
+            "special": true,
+            "upper": true
+          },
+          "sensitive_values": {
+            "bcrypt_hash": true,
+            "result": true
+          }
+        },
+        {
+          "address": "random_password.per_env[\"prod\"]",
+          "mode": "managed",
+          "type": "random_password",
+          "name": "per_env",
+          "index": "prod",
+          "provider_name": "registry.terraform.io/hashicorp/random",
+          "schema_version": 3,
+          "values": {
+            "bcrypt_hash": "FIXTURE-SECRET-04",
+            "id": "none",
+            "keepers": null,
+            "length": 10,
+            "lower": true,
+            "min_lower": 0,
+            "min_numeric": 0,
+            "min_special": 0,
+            "min_upper": 0,
+            "number": true,
+            "numeric": true,
+            "override_special": null,
+            "result": "FIXTURE-SECRET-11",
+            "special": true,
+            "upper": true
+          },
+          "sensitive_values": {
+            "bcrypt_hash": true,
+            "result": true
+          }
+        },
+        {
+          "address": "random_pet.renamed",
+          "mode": "managed",
+          "type": "random_pet",
+          "name": "renamed",
+          "provider_name": "registry.terraform.io/hashicorp/random",
+          "schema_version": 0,
+          "values": {
+            "id": "delicate-pangolin",
+            "keepers": null,
+            "length": 2,
+            "prefix": null,
+            "separator": "-"
+          },
+          "sensitive_values": {}
+        },
+        {
+          "address": "random_string.cbd",
+          "mode": "managed",
+          "type": "random_string",
+          "name": "cbd",
+          "provider_name": "registry.terraform.io/hashicorp/random",
+          "schema_version": 2,
+          "values": {
+            "id": "L-7K&8t3",
+            "keepers": {
+              "k": "2"
+            },
+            "length": 8,
+            "lower": true,
+            "min_lower": 0,
+            "min_numeric": 0,
+            "min_special": 0,
+            "min_upper": 0,
+            "number": true,
+            "numeric": true,
+            "override_special": null,
+            "result": "L-7K&8t3",
+            "special": true,
+            "upper": true
+          },
+          "sensitive_values": {
+            "keepers": {}
+          }
+        },
+        {
+          "address": "terraform_data.cfg",
+          "mode": "managed",
+          "type": "terraform_data",
+          "name": "cfg",
+          "provider_name": "terraform.io/builtin/terraform",
+          "schema_version": 0,
+          "values": {
+            "id": "d085f8d4-9c26-759a-8d47-dad5b7cf50f2",
+            "input": {
+              "pw": "FIXTURE-SECRET-15",
+              "version": "2"
+            },
+            "output": {
+              "pw": "FIXTURE-SECRET-15",
+              "version": "2"
+            },
+            "triggers_replace": null
+          },
+          "sensitive_values": {
+            "input": {
+              "pw": true
+            },
+            "output": {}
+          }
+        },
+        {
+          "address": "terraform_data.with_token",
+          "mode": "managed",
+          "type": "terraform_data",
+          "name": "with_token",
+          "provider_name": "terraform.io/builtin/terraform",
+          "schema_version": 0,
+          "values": {
+            "id": "442caadd-37d2-988f-71f2-b4496c7a435d",
+            "input": {
+              "api_token": "FIXTURE-plain-token-value",
+              "db_password": "FIXTURE-plain-password-value",
+              "note": "not a secret"
+            },
+            "output": {
+              "api_token": "FIXTURE-plain-token-value",
+              "db_password": "FIXTURE-plain-password-value",
+              "note": "not a secret"
+            },
+            "triggers_replace": null
+          },
+          "sensitive_values": {
+            "input": {},
+            "output": {}
+          }
+        },
+        {
+          "address": "tls_private_key.k",
+          "mode": "managed",
+          "type": "tls_private_key",
+          "name": "k",
+          "provider_name": "registry.terraform.io/hashicorp/tls",
+          "schema_version": 1,
+          "values": {
+            "algorithm": "ECDSA",
+            "ecdsa_curve": "P384",
+            "id": "5bc2a7be7201f56f4f43df5c7885f9ba6db0f9f2",
+            "private_key_openssh": "FIXTURE-SECRET-08",
+            "private_key_pem": "FIXTURE-SECRET-06",
+            "private_key_pem_pkcs8": "FIXTURE-SECRET-09",
+            "public_key_fingerprint_md5": "83:74:49:ec:b2:9c:a5:d4:ad:a1:7b:4c:0d:05:77:42",
+            "public_key_fingerprint_sha256": "SHA256:4V3vzFUXTgQ8UHeU2KlqjfC5RGAgSG2xRcBXxPEjxCw",
+            "public_key_openssh": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBBUpGtPsDZZaTfHC0I20P5wZaoj+bPCkvb3ZJP2NpCYvnAMtKcYw9u4HuoyGaDoIjYk3BWinnh/wX6qGsHowfsNgob4ZjErW3kGZepunETAgEMre+AR+WaOALrjSbixjoQ==\n",
+            "public_key_pem": "-----BEGIN PUBLIC KEY-----\nMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEFSka0+wNllpN8cLQjbQ/nBlqiP5s8KS9\nvdkk/Y2kJi+cAy0pxjD27ge6jIZoOgiNiTcFaKeeH/BfqoawejB+w2ChvhmMStbe\nQZl6m6cRMCAQyt74BH5Zo4AuuNJuLGOh\n-----END PUBLIC KEY-----\n",
+            "rsa_bits": 2048
+          },
+          "sensitive_values": {
+            "private_key_openssh": true,
+            "private_key_pem": true,
+            "private_key_pem_pkcs8": true
+          }
+        }
+      ],
+      "child_modules": [
+        {
+          "resources": [
+            {
+              "address": "module.naming.random_pet.this",
+              "mode": "managed",
+              "type": "random_pet",
+              "name": "this",
+              "provider_name": "registry.terraform.io/hashicorp/random",
+              "schema_version": 0,
+              "values": {
+                "id": "svc-internal-bobcat",
+                "keepers": null,
+                "length": 2,
+                "prefix": "svc",
+                "separator": "-"
+              },
+              "sensitive_values": {}
+            }
+          ],
+          "address": "module.naming"
+        }
+      ]
+    }
+  },
+  "checks": [
+    {
+      "address": {
+        "kind": "var",
+        "module": "module.label",
+        "name": "context",
+        "to_display": "module.label.var.context"
+      },
+      "status": "pass",
+      "instances": [
+        {
+          "address": {
+            "module": "module.label",
+            "to_display": "module.label.var.context"
+          },
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "address": {
+        "kind": "var",
+        "module": "module.label",
+        "name": "id_length_limit",
+        "to_display": "module.label.var.id_length_limit"
+      },
+      "status": "pass",
+      "instances": [
+        {
+          "address": {
+            "module": "module.label",
+            "to_display": "module.label.var.id_length_limit"
+          },
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "address": {
+        "kind": "var",
+        "module": "module.label",
+        "name": "label_key_case",
+        "to_display": "module.label.var.label_key_case"
+      },
+      "status": "pass",
+      "instances": [
+        {
+          "address": {
+            "module": "module.label",
+            "to_display": "module.label.var.label_key_case"
+          },
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "address": {
+        "kind": "var",
+        "module": "module.label",
+        "name": "label_value_case",
+        "to_display": "module.label.var.label_value_case"
+      },
+      "status": "pass",
+      "instances": [
+        {
+          "address": {
+            "module": "module.label",
+            "to_display": "module.label.var.label_value_case"
+          },
+          "status": "pass"
+        }
+      ]
+    },
+    {
+      "address": {
+        "kind": "var",
+        "module": "module.naming",
+        "name": "prefix",
+        "to_display": "module.naming.var.prefix"
+      },
+      "status": "pass",
+      "instances": [
+        {
+          "address": {
+            "module": "module.naming",
+            "to_display": "module.naming.var.prefix"
+          },
+          "status": "pass"
+        }
+      ]
+    }
+  ]
+}
