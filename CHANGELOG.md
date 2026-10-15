@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] -- 2026-10-15
+
 ### Added
 - Initial release: `tf_list_providers`, `tf_search_types`, `tf_get_schema` and
   `tf_check_arguments`, answering from `terraform providers schema -json` for the
