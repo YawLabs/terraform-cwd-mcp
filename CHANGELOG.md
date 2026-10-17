@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] -- 2026-10-16
+
 ### Security
 - `tf_upgrade_impact` no longer writes the lock or override file through a
   symlink copied from the root: a `.terraform.lock.hcl` symlinked to a shared

@@ -1,6 +1,6 @@
 {
   "name": "@yawlabs/terraform-cwd-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "mcpName": "io.github.YawLabs/terraform-cwd-mcp",
   "description": "Terraform MCP server for what is true in THIS working directory: exact pinned provider schemas, saved plans, state (redacted), local modules and provider-upgrade impact",
   "license": "MIT",
