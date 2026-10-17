@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `tf_upgrade_impact` no longer writes the lock or override file through a
+  symlink copied from the root: a `.terraform.lock.hcl` symlinked to a shared
+  lock could be overwritten with the target provider version.
+- `tf_upgrade_impact` applies its exclusions (`.terraform`, `.git`, state,
+  `*.tfvars`, plans) before copying links, so a symlinked excluded entry is no
+  longer linked into the temp copy. Saved plans are excluded by name (`tfplan`,
+  `plan.out`, `*.plan`) and by content (a zip whose first entry is `tfplan`).
+- `tf_upgrade_impact` skips `modules.json` dirs that are UNC or device paths
+  before touching them (no SMB lookup).
+- State output redacts the `value` of a name/value pair whose name is
+  secret-like (helm `set`, kubernetes `env`, ECS `container_definitions` JSON).
+- Inline credential masking covers `PGPASSWORD=`-style run-together names,
+  `DB_PASS=`, `Authorization: Bearer|Basic ...` and Azure SAS `sig=`; value
+  shapes add Vault (`hvs.`/`hvb.`/`hvr.`), HCP Terraform (`.atlasv1.`) and
+  Stripe (`sk_live_`/`rk_live_`/`sk_test_`) tokens.
+- `tf_module_interface` masks credentials in module sources (URL userinfo,
+  `sshkey`, `token`, `sig` and other secret query parameters).
+
+### Fixed
+- `tf_upgrade_impact`: a file-system error while copying the configuration
+  degrades to "schema comparison only" instead of failing the tool.
+- Override files: a `dynamic "x"` block replaces the base's `x` blocks (static
+  and dynamic) and no longer removes other `dynamic` blocks, matching Terraform.
+- `npm run typecheck` accepts an oam binary only when it prints oam's version
+  banner (`OAM_BIN` pointing at node falls back to tsc).
+- `release.sh` checks for a clean tree, `HEAD == origin/main` and `jq`.
+
 ## [0.1.0] -- 2026-10-15
 
 ### Added
