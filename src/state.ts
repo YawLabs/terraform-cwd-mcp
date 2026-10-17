@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { childMarker, collectSensitiveStrings, type Marker, Redactor, SENSITIVE } from "./redact.js";
+import { childMarker, collectSensitiveStrings, type Marker, pairedSecretName, Redactor, SENSITIVE } from "./redact.js";
 import { assertInitialized, type TerraformExec, TimeoutError } from "./schema.js";
 
 /**
@@ -323,7 +323,12 @@ export function renderResource(res: StateResource, sensitive: Set<string>, opts:
         lines.push(`  ${path} = {}`);
         return;
       }
-      for (const [k, v] of entries) walk(v, childMarker(marker, k), pathJoin(path, k), [...keys, k]);
+      // `{ name = "DB_PASSWORD", value = "x" }`: the value is named by its sibling, not by "value".
+      const paired = pairedSecretName(value as Record<string, unknown>);
+      for (const [k, v] of entries) {
+        const childKeys = paired !== null && k === "value" ? [...keys, k, paired] : [...keys, k];
+        walk(v, childMarker(marker, k), pathJoin(path, k), childKeys);
+      }
       return;
     }
     if (typeof value === "string") {

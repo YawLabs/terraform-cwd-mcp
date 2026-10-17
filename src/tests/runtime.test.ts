@@ -36,12 +36,16 @@ afterAll(() => {
 });
 
 /** Run a probe script that imports the REAL scripts/runtime.mjs and prints one JSON line. */
-function probe(body: string): unknown {
+function probe(body: string, nodeArgs: string[] = []): unknown {
   const dir = mkTemp("tfcwd-runtime-probe-");
   const file = join(dir, "probe.mjs");
   const importLine = `import { describeRuntime, findOam, isBuildTreeBinary } from ${JSON.stringify(`file://${RUNTIME.replace(/\\/g, "/")}`)};`;
   writeFileSync(file, `${importLine}\n${body}`);
-  const res = spawnSync(process.execPath, [file], { encoding: "utf-8", env: { ...process.env }, timeout: 60_000 });
+  const res = spawnSync(process.execPath, [...nodeArgs, file], {
+    encoding: "utf-8",
+    env: { ...process.env },
+    timeout: 60_000,
+  });
   const line = (res.stdout ?? "").trim().split("\n").filter(Boolean).at(-1) ?? "";
   try {
     return JSON.parse(line);
@@ -101,30 +105,62 @@ describe("scripts/runtime.mjs describeRuntime()", () => {
  * compare would make `=NODE` silently run the typecheck on oam the launcher
  * would have refused.
  *
- * `OAM_BIN` is a RUNNABLE binary here (the Node running the test): with a real
- * oam discoverable, `findOam()` returns it, so `null` is evidence the early
- * return fired rather than that nothing was found. A fake that cannot be
- * spawned would return null either way and prove nothing.
+ * `OAM_BIN` is the Node running the test, and a `--import` preload (the same
+ * trick as launcher.test.ts's poseAsOam) makes runtime.mjs's `--version` probe
+ * of it answer "oam 0.19.0": a runnable binary that identifies as oam, on every
+ * platform, so `null` under RUNTIME=node is evidence the early return fired
+ * rather than that nothing was found.
  */
-describe("scripts/runtime.mjs: RUNTIME=node skips discovery", () => {
-  /** Isolation: OAM_BIN is the only discoverable candidate. */
-  const probeWith = (runtime: string) =>
-    probe(`process.env.OAM_BIN = ${JSON.stringify(process.execPath)};
+const POSE_AS_OAM = [
+  "--import",
+  `data:text/javascript,${encodeURIComponent(
+    [
+      'import poseCp from "node:child_process";',
+      'import { syncBuiltinESMExports as poseSync } from "node:module";',
+      "const poseReal = poseCp.execFileSync;",
+      "poseCp.execFileSync = function (cmd, args, opts) {",
+      `  if (cmd === ${JSON.stringify(process.execPath)} && args?.[0] === "--version") return "oam 0.19.0\\n";`,
+      "  return poseReal.call(this, cmd, args, opts);",
+      "};",
+      "poseSync();",
+    ].join("\n"),
+  )}`,
+];
+
+/** Isolation: OAM_BIN is the only discoverable candidate. */
+const probeWith = (runtime: string, nodeArgs: string[] = POSE_AS_OAM) =>
+  probe(
+    `process.env.OAM_BIN = ${JSON.stringify(process.execPath)};
 process.env.TERRAFORM_CWD_MCP_RUNTIME = ${JSON.stringify(runtime)};
 process.env.HOME = ${JSON.stringify(mkTemp("tfcwd-rt-home-"))};
 process.env.USERPROFILE = process.env.HOME;
 process.env.LOCALAPPDATA = process.env.HOME;
 process.env.PATH = process.env.HOME;
-process.stdout.write(JSON.stringify(findOam()));`);
+process.stdout.write(JSON.stringify(findOam()));`,
+    nodeArgs,
+  );
 
-  it("finds and probes the runnable OAM_BIN when no runtime is forced (guards the case below)", () => {
+describe("scripts/runtime.mjs: RUNTIME=node skips discovery", () => {
+  it("finds the OAM_BIN that answers with oam's banner when no runtime is forced (guards the case below)", () => {
     // Without this control, the assertion below could pass because OAM_BIN was
-    // never runnable, not because discovery was skipped.
-    expect(probeWith("")).toMatchObject({ cmd: process.execPath });
+    // never accepted, not because discovery was skipped.
+    expect(probeWith("")).toEqual({ cmd: process.execPath, version: "oam 0.19.0", fromBuildTree: false });
   });
 
   it("returns null without probing when the value is a non-lowercase 'node'", () => {
     expect(probeWith("NODE")).toBeNull();
+  });
+});
+
+/**
+ * Answering `--version` is not enough: node prints "v22.x.y", and accepting it
+ * would make `npm run typecheck` run `node check .` and fail instead of falling
+ * back to tsc. findOam requires oam's banner, as the launcher's oamBanner does.
+ */
+describe("scripts/runtime.mjs: a non-oam OAM_BIN", () => {
+  it("skips a binary that runs but does not identify as oam", () => {
+    // The real node, unposed, as the only candidate.
+    expect(probeWith("", [])).toBeNull();
   });
 });
 

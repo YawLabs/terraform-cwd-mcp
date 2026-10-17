@@ -157,11 +157,20 @@ function providerLocalName(a: Attr | undefined): string | undefined {
   return m?.[1];
 }
 
-/** Merge an override body into a base body: attributes replace by name, nested blocks of a type replace all of that type. */
+/**
+ * The block type a nested block contributes for override merging: `dynamic "x"`
+ * generates `x` blocks, so it is keyed by its label, as Terraform does.
+ */
+const mergeKey = (b: Block): string => (b.type === "dynamic" ? (b.labels[0] ?? "") : b.type);
+
+/**
+ * Merge an override body into a base body: attributes replace by name, nested
+ * blocks of a type (static or `dynamic "<type>"`) replace all of that type.
+ */
 function mergeBody(base: Body, ov: Body): Body {
   const attrs = base.attrs.filter((a) => !ov.attrs.some((o) => o.name === a.name)).concat(ov.attrs);
-  const ovTypes = new Set(ov.blocks.map((b) => b.type));
-  const blocks = base.blocks.filter((b) => !ovTypes.has(b.type)).concat(ov.blocks);
+  const ovTypes = new Set(ov.blocks.map(mergeKey));
+  const blocks = base.blocks.filter((b) => !ovTypes.has(mergeKey(b))).concat(ov.blocks);
   return { attrs, blocks };
 }
 

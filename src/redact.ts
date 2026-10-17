@@ -14,7 +14,8 @@
  *    of >= 4 digits.
  * 3. Key names: a string, number or bool under a secret-like key (own or ancestor).
  * 4. Value shape: private keys (PEM, also base64-encoded), JWTs, well-known
- *    token prefixes; URL passwords and inline `password=...` credentials are
+ *    token prefixes; URL passwords, inline `password=...` credentials, `Bearer`
+ *    tokens, SAS `sig=` and secret-named `{"name","value"}` JSON pairs are
  *    masked in place.
  */
 
@@ -174,6 +175,20 @@ export function isSecretKey(key: string): boolean {
   return false;
 }
 
+/**
+ * For a `{ name, value }` / `{ key, value }` list entry (helm_release `set`,
+ * kubernetes `env`, ECS `environment`): the secret-like `name`/`key` string that
+ * should count as the key of the `value` sibling, else null.
+ */
+export function pairedSecretName(obj: Record<string, unknown>): string | null {
+  if (!Object.hasOwn(obj, "value")) return null;
+  for (const k of ["name", "key"]) {
+    const n = Object.hasOwn(obj, k) ? obj[k] : undefined;
+    if (typeof n === "string" && isSecretKey(n)) return n;
+  }
+  return null;
+}
+
 // --- Layer 4: value shape ---------------------------------------------------
 
 const SHAPES: RegExp[] = [
@@ -186,6 +201,9 @@ const SHAPES: RegExp[] = [
   /\bnpm_[A-Za-z0-9]{36}\b/,
   /\bsk-[A-Za-z0-9_-]{20,}/,
   /\bAIza[0-9A-Za-z_-]{35}/,
+  /\bhv[sbr]\.[A-Za-z0-9_-]{20,}/, // Vault service / batch / recovery tokens
+  /\b[A-Za-z0-9]{10,}\.atlasv1\.[A-Za-z0-9_-]{20,}/, // HCP Terraform / TFE API tokens
+  /\b[rs]k_(live|test)_[A-Za-z0-9]{10,}/, // Stripe secret and restricted keys (pk_ is publishable)
   // base64 of "-----BEGIN ... PRIVATE KEY" (kubeconfig client-key-data): the three alignments of "PRIVATE KEY".
   /LS0tLS1CRUdJTi[A-Za-z0-9+/=]{0,40}(UFJJVkFURSBLRVk|BSSVZBVEUgS0VZ|UklWQVRFIEtFW)/,
 ];
@@ -207,20 +225,48 @@ export function maskUrlPasswords(s: string): string | null {
 /**
  * `Password=x;`, `--password=x`, `"token": "x"`, `AccountKey=x` inside a longer
  * string (connection strings, command lines, embedded JSON). The key may carry a
- * prefix joined by `_` / `-` (`aws_secret_access_key=`).
+ * prefix joined by `_` / `-` (`aws_secret_access_key=`, `DB_PASS=`), and the
+ * strong words also a run-together one (`PGPASSWORD=`, `MYSQLPWD=`). `pass` only
+ * counts as a whole token, so `bypass=` and `compass=` are left alone.
  */
 const INLINE_CREDENTIAL =
-  /\b((?:[a-z0-9]+[_-])*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|account[_-]?key|shared[_-]?access[_-]?key|client[_-]?secret)["']?\s*[=:]\s*)("[^"]*"|'[^']*'|[^;\s&"',]+)/gi;
+  /\b((?:[a-z0-9]+[_-])*(?:[a-z0-9]*(?:password|passwd|pwd|secret)|token|pass|authorization|api[_-]?key|access[_-]?key|secret[_-]?key|account[_-]?key|shared[_-]?access[_-]?key|client[_-]?secret)["']?\s*[=:]\s*)((?:(?:bearer|basic)\s+)?(?:"[^"]*"|'[^']*'|[^;\s&"',]+))/gi;
+
+/**
+ * `Bearer <token>` / `Basic <creds>` (an Authorization header inside a string).
+ * The credential must hold a digit, `+` `/` `=`, or an uppercase letter past its
+ * first, or be 20+ chars, so prose ("basic monitoring", "Bearer authentication") stays.
+ */
+const AUTH_SCHEME =
+  /\b((?:[Bb]earer|BEARER|[Bb]asic|BASIC)\s+)((?=[A-Za-z0-9._~+/-]*[0-9+/=]|[A-Za-z0-9._~+/-]+[A-Z])[A-Za-z0-9._~+/-]{8,}=*|[A-Za-z0-9._~+/-]{20,}=*)/g;
+
+/** The `sig=` of an Azure SAS URL / token (`?sv=...&sig=...`). */
+const SAS_SIG = /([?&;]sig=)([^&\s"';]+)/gi;
+
+/**
+ * `{"name":"DB_PASSWORD","value":"x"}` in JSON held as a string (ECS
+ * `container_definitions` environment): the value is masked when the name is
+ * secret-like (`isSecretKey`). Either key order.
+ */
+const NAME_VALUE_JSON =
+  /("(?:name|key)"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"value"\s*:\s*)"(?:[^"\\]|\\.)*"|("value"\s*:\s*)"(?:[^"\\]|\\.)*"(\s*,\s*"(?:name|key)"\s*:\s*"((?:[^"\\]|\\.)*)")/g;
 
 /** Mask inline `key=value` credentials. Returns null when there is none. */
 export function maskInlineCredentials(s: string): string | null {
-  INLINE_CREDENTIAL.lastIndex = 0;
-  if (!INLINE_CREDENTIAL.test(s)) return null;
-  INLINE_CREDENTIAL.lastIndex = 0;
-  return s.replace(INLINE_CREDENTIAL, (_m, key: string, value: string) => {
+  let out = s.replace(AUTH_SCHEME, "$1(redacted)");
+  out = out.replace(INLINE_CREDENTIAL, (_m, key: string, value: string) => {
     const q = value[0] === '"' || value[0] === "'" ? value[0] : "";
     return `${key}${q}(redacted)${q}`;
   });
+  out = out.replace(SAS_SIG, "$1(redacted)");
+  out = out.replace(
+    NAME_VALUE_JSON,
+    (m, pre?: string, name?: string, preV?: string, post?: string, nameAfter?: string) => {
+      if (pre !== undefined) return isSecretKey(name!) ? `${pre}"(redacted)"` : m;
+      return isSecretKey(nameAfter!) ? `${preV}"(redacted)"${post}` : m;
+    },
+  );
+  return out === s ? null : out;
 }
 
 /** Both in-place masks (URL passwords, inline credentials). Returns null when neither applied. */

@@ -1,6 +1,16 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadModule } from "../config.js";
 import type { ExecOptions, ProviderSchema, RunResult, SchemaDump } from "../schema.js";
@@ -581,6 +591,8 @@ interface FakeOpts {
   validateStdout?: string;
   /** Throw a TimeoutError for this command (`init` or `validate`), like exec does when it kills terraform. */
   timeout?: "init" | "validate";
+  /** Called with the temp copy's root on every validate. */
+  onValidate?: (cwd: string) => void;
 }
 
 /** A fake terraform that behaves like the real one for the commands tf_upgrade_impact runs. */
@@ -619,6 +631,7 @@ function fakeTerraform(
     }
     if (cmd === "validate") {
       seen.validateDirs.push(cwd);
+      o.onValidate?.(cwd);
       const lockText = readFileSync(join(cwd, ".terraform.lock.hcl"), "utf8");
       const ov = join(cwd, "zz_tfcwd_upgrade_override.tf");
       if (existsSync(ov)) seen.overrides.push(readFileSync(ov, "utf8"));
@@ -881,6 +894,101 @@ describe("upgradeImpact end to end (fake terraform, real files)", () => {
     expect(out).toMatch(
       /validate: skipped \(the plugin cache has no package for hashicorp\/tls 4\.0\.6 at .* and re-downloading it failed; rerun with registry access\)/,
     );
+  });
+});
+
+// --- Temp-copy hygiene: exclusions, links, UNC manifest dirs ---------------------------------------------
+
+/** symlinkSync, or false where the OS refuses it (file links on Windows without developer mode). */
+function tryLink(target: string, path: string, type: "file" | "dir"): boolean {
+  try {
+    symlinkSync(target, path, type === "dir" && process.platform === "win32" ? "junction" : type);
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "EPERM") return false;
+    throw e;
+  }
+}
+
+/** A zip local file header whose first entry is `name` (what planfile.Create writes first: `tfplan`). */
+function zipWithFirstEntry(name: string): Buffer {
+  const head = Buffer.alloc(30);
+  head.writeUInt32BE(0x504b0304, 0);
+  head.writeUInt16LE(Buffer.byteLength(name), 26);
+  return Buffer.concat([head, Buffer.from(name), Buffer.from("payload")]);
+}
+const ZIP = zipWithFirstEntry("tfplan");
+const tlsCall = (store: SchemaStore, root: string) =>
+  upgradeImpact(store, {
+    provider: "hashicorp/tls",
+    version: "4.0.6",
+    dir: root,
+    validate: true,
+    includeUnused: false,
+  });
+
+describe("temp copy hygiene", () => {
+  it("excludes plans by name and by zip magic, and excluded names even when they are links", async () => {
+    const root = upgradeRoot();
+    const outside = tempDir("tfcwd-outside-");
+    mkdirSync(join(outside, "gitdir"));
+    writeFileSync(join(outside, "gitdir", "HEAD"), "ref");
+    writeFileSync(join(outside, "secret.tfvars"), 'pw = "FIXTURE-SECRET"');
+    for (const n of ["tfplan", "plan.out", "prod.plan", "renamed-plan.bin"]) writeFileSync(join(root, n), ZIP);
+    writeFileSync(join(root, "keep.txt"), "keep");
+    writeFileSync(join(root, "lambda.zip"), zipWithFirstEntry("index.js"));
+    tryLink(join(outside, "gitdir"), join(root, ".git"), "dir");
+    tryLink(join(outside, "gitdir"), join(root, "terraform.tfstate.d"), "dir");
+    const fileLinks = tryLink(join(outside, "secret.tfvars"), join(root, "linked.tfvars"), "file");
+    const listings: string[][] = [];
+    const { store, seen } = upgradeStore({ onValidate: (cwd) => listings.push(readdirSync(cwd).sort()) });
+    await tlsCall(store, root);
+    expect(seen.validateDirs).toHaveLength(2);
+    for (const l of listings) {
+      expect(l).toContain("keep.txt");
+      expect(l).toContain("lambda.zip");
+      expect(l).toContain("main.tf");
+      for (const n of ["tfplan", "plan.out", "prod.plan", "renamed-plan.bin", ".git", "terraform.tfstate.d"]) {
+        expect(l).not.toContain(n);
+      }
+      if (fileLinks) expect(l).not.toContain("linked.tfvars");
+    }
+  });
+
+  it("never writes the lock file through a copied link onto the user's file", async (ctx) => {
+    const root = upgradeRoot();
+    const outside = tempDir("tfcwd-outside-");
+    const realLock = join(outside, "real.lock.hcl");
+    const lockText = readFileSync(join(root, ".terraform.lock.hcl"), "utf8");
+    writeFileSync(realLock, lockText);
+    rmSync(join(root, ".terraform.lock.hcl"));
+    if (!tryLink(realLock, join(root, ".terraform.lock.hcl"), "file")) ctx.skip();
+    const locks: string[] = [];
+    const { store, seen } = upgradeStore({
+      onValidate: (cwd) => locks.push(readFileSync(join(cwd, ".terraform.lock.hcl"), "utf8")),
+    });
+    await tlsCall(store, root);
+    expect(seen.validateDirs).toHaveLength(2);
+    expect(locks[1]).toContain('"4.0.6"');
+    expect(readFileSync(realLock, "utf8")).toBe(lockText);
+  });
+
+  it("skips a manifest module dir that is a UNC path, before touching it", async () => {
+    const root = upgradeRoot();
+    const file = join(root, ".terraform", "modules", "modules.json");
+    const manifest = JSON.parse(readFileSync(file, "utf8")) as {
+      Modules: { Key: string; Source: string; Dir: string }[];
+    };
+    manifest.Modules.push({ Key: "smb", Source: "./smb", Dir: "//nohost.invalid/share/mod" });
+    // An existing dir spelled as a device / double-slash path: without the guard it would load as module "dev".
+    const certs = resolve(root, "modules", "certs");
+    const devDir = process.platform === "win32" ? `\\\\?\\${certs}` : `/${certs}`;
+    manifest.Modules.push({ Key: "dev", Source: "./dev", Dir: devDir });
+    writeFileSync(file, JSON.stringify(manifest));
+    expect((await loadModules(root)).map((u) => u.key)).toEqual(["", "certs"]);
+    const { store, seen } = upgradeStore();
+    await tlsCall(store, root);
+    expect(seen.validateDirs).toHaveLength(2);
   });
 });
 

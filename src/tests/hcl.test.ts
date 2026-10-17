@@ -11,7 +11,7 @@ import {
   parseTfJson,
   unescapeQuoted,
 } from "../hcl.js";
-import { addressToKey, moduleInterface, normalizeModuleSource } from "../module.js";
+import { addressToKey, moduleInterface, normalizeModuleSource, redactModuleSource } from "../module.js";
 import { cleanupTempDirs, fixtureCopy, readFixtureJson, tempDir } from "./helpers.js";
 
 afterEach(cleanupTempDirs);
@@ -295,6 +295,37 @@ terraform {
     expect(m.requiredProviders.get("aws")!.version).toBe("~> 5.0");
   });
 
+  it('keys override nested blocks by generated type (dynamic "x" replaces static x and dynamic "x" only)', async () => {
+    const dir = tempDir();
+    writeFileSync(
+      join(dir, "main.tf"),
+      `resource "aws_security_group" "g" {
+  ingress { from_port = 1 }
+  dynamic "ingress" {
+    for_each = []
+    content { from_port = 2 }
+  }
+  dynamic "egress" {
+    for_each = []
+    content { from_port = 3 }
+  }
+  timeouts { create = "1m" }
+}`,
+    );
+    writeFileSync(
+      join(dir, "override.tf"),
+      `resource "aws_security_group" "g" {
+  dynamic "ingress" {
+    for_each = [1]
+    content { from_port = 4 }
+  }
+}`,
+    );
+    const m = await loadModule(dir);
+    const blocks = m.resources[0]!.body.blocks.map((b) => [b.type, ...b.labels].join(":"));
+    expect(blocks).toEqual(["dynamic:egress", "timeouts", "dynamic:ingress"]);
+  });
+
   it("resolves providers: meta-argument, required_providers local names, legacy shorthand", async () => {
     const dir = tempDir();
     writeFileSync(
@@ -385,6 +416,48 @@ describe("tf_module_interface", () => {
     expect((await moduleInterface(root, "module.label", 20)).split("\n")).toContain(
       "  enabled: bool optional default=null - Set to false to prev...",
     );
+  });
+
+  it("redacts credentials in module sources (userinfo, secret query params, secret shapes)", async () => {
+    expect(redactModuleSource("git::https://oauth2:FIXTURE-SECRET@gitlab.com/x.git?ref=v1")).toBe(
+      "git::https://oauth2:(redacted)@gitlab.com/x.git?ref=v1",
+    );
+    expect(redactModuleSource("git::https://FIXTURE-SECRET@github.com/x.git")).toBe(
+      "git::https://(redacted)@github.com/x.git",
+    );
+    expect(redactModuleSource("git::ssh://git@github.com/x.git?ref=v1&sshkey=FIXTURE-SECRET")).toBe(
+      "git::ssh://git@github.com/x.git?ref=v1&sshkey=(redacted)",
+    );
+    expect(redactModuleSource("https://b.s3.amazonaws.com/m.zip?X-Amz-Signature=FIXTURE-SECRET&x=1")).toBe(
+      "https://b.s3.amazonaws.com/m.zip?X-Amz-Signature=(redacted)&x=1",
+    );
+    expect(redactModuleSource("git@github.com:org/repo.git//sub?ref=main")).toBe(
+      "git@github.com:org/repo.git//sub?ref=main",
+    );
+    expect(redactModuleSource(`git::https://github.com/ghp_${"a".repeat(36)}/x.git`)).toBe(
+      "(redacted: secret-like value)",
+    );
+
+    const root = tempDir();
+    mkdirSync(join(root, ".terraform", "modules"), { recursive: true });
+    writeFileSync(
+      join(root, "main.tf"),
+      'module "m" {\n  source = "git::https://oauth2:FIXTURE-SECRET@gitlab.com/x.git?sshkey=FIXTURE-plain"\n}\n',
+    );
+    writeFileSync(
+      join(root, ".terraform", "modules", "modules.json"),
+      JSON.stringify({
+        Modules: [
+          { Key: "", Source: "", Dir: "." },
+          { Key: "m", Source: "git::https://oauth2:FIXTURE-SECRET@gitlab.com/y.git", Dir: ".terraform/modules/m" },
+        ],
+      }),
+    );
+    const out = await moduleInterface(root, undefined, 160);
+    expect(out).toContain(
+      "  m: source=git::https://oauth2:(redacted)@gitlab.com/x.git?sshkey=(redacted) -> STALE: installed from git::https://oauth2:(redacted)@gitlab.com/y.git, config says git::https://oauth2:(redacted)@gitlab.com/x.git?sshkey=(redacted); run terraform init",
+    );
+    expect(out).not.toMatch(/FIXTURE-SECRET|FIXTURE-plain/);
   });
 
   it("reports missing, stale and not-installed module calls", async () => {

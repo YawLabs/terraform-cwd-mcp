@@ -1,13 +1,16 @@
 import { createHash } from "node:crypto";
 import {
+  closeSync,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -33,6 +36,7 @@ import type { Body } from "./hcl.js";
 import { keyToAddress, readManifest } from "./module.js";
 import {
   assertInitialized,
+  assertLocalPath,
   KINDS,
   type Kind,
   type ProviderSchema,
@@ -308,11 +312,24 @@ function relDisplay(root: string, p: string): string {
   return rel.split(sep).join("/");
 }
 
+/** False for a UNC or device path: touching one on Windows opens SMB (and can leak the NTLM hash). */
+function isLocalPath(p: string): boolean {
+  try {
+    assertLocalPath(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** The root plus every module in `.terraform/modules/modules.json` (local and downloaded). */
 export async function loadModules(root: string): Promise<ModuleUnit[]> {
   const units: ModuleUnit[] = [{ key: "", address: "", dir: root, display: "", config: await loadModule(root) }];
   const manifest = readManifest(root) ?? [];
-  const entries = manifest.filter((e) => e.Key !== "").sort((a, b) => (a.Key < b.Key ? -1 : a.Key > b.Key ? 1 : 0));
+  // A manifest Dir that is a UNC/device path is skipped before any fs call.
+  const entries = manifest
+    .filter((e) => e.Key !== "" && isLocalPath(e.Dir))
+    .sort((a, b) => (a.Key < b.Key ? -1 : a.Key > b.Key ? 1 : 0));
   for (const e of entries) {
     const dir = resolve(root, e.Dir);
     if (!existsSync(dir)) continue;
@@ -1134,8 +1151,34 @@ function excludedFile(name: string): boolean {
     /\.tfvars$/.test(name) ||
     /\.tfvars\.json$/.test(name) ||
     /\.tfplan$/.test(name) ||
+    /\.plan$/.test(name) ||
+    name === "tfplan" ||
+    name === "plan.out" ||
     name === "crash.log"
   );
+}
+
+/**
+ * A saved plan, whatever it is named: a zip (PK\x03\x04) whose first entry is
+ * Terraform's (`tfplan`, written first by planfile.Create). Plans hold plaintext
+ * sensitive values. Other zips (Lambda bundles read by filebase64) are copied.
+ */
+function isSavedPlan(path: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(64);
+    const n = readSync(fd, buf, 0, 64, 0);
+    if (n < 30 || buf.readUInt32BE(0) !== 0x504b0304) return false;
+    const nameLen = buf.readUInt16LE(26);
+    if (30 + nameLen > n) return false;
+    const name = buf.toString("utf8", 30, 30 + nameLen);
+    return name === "tfplan" || name === "tfstate" || name === "tfstate-prev" || name.startsWith("tfconfig/");
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 interface CopyBudget {
@@ -1159,6 +1202,9 @@ function copyTree(src: string, dst: string, budget: CopyBudget, excludeDirs: boo
   for (const name of readdirSync(src)) {
     const from = join(src, name);
     const to = join(dst, name);
+    // Name-based exclusions come first, so a symlinked .terraform / .git / state / tfvars / plan is not linked in.
+    if (excludeDirs && EXCLUDED_DIRS.has(name)) continue;
+    if (excludedFile(name)) continue;
     const st = lstatSync(from);
     if (st.isSymbolicLink()) {
       // Copied as a link, never followed.
@@ -1184,11 +1230,10 @@ function copyTree(src: string, dst: string, budget: CopyBudget, excludeDirs: boo
       continue;
     }
     if (st.isDirectory()) {
-      if (excludeDirs && EXCLUDED_DIRS.has(name)) continue;
       copyTree(from, to, budget, excludeDirs);
       continue;
     }
-    if (!st.isFile() || excludedFile(name)) continue;
+    if (!st.isFile() || isSavedPlan(from)) continue;
     budget.files++;
     budget.bytes += st.size;
     if (budget.files > MAX_COPY_FILES || budget.bytes > MAX_COPY_BYTES) {
@@ -1240,7 +1285,7 @@ export async function validateComparison(x: ValidateInput): Promise<{ diff: Diag
   const manifest = readManifest(x.root) ?? [];
   const modulesDir = join(x.root, ".terraform", "modules");
   const localDirs = manifest
-    .filter((e) => e.Key !== "")
+    .filter((e) => e.Key !== "" && isLocalPath(e.Dir))
     .map((e) => resolve(x.root, e.Dir))
     .filter((d) => {
       const rel = relative(modulesDir, d);
@@ -1255,9 +1300,22 @@ export async function validateComparison(x: ValidateInput): Promise<{ diff: Diag
   try {
     const tmpRoot = join(base, relative(ancestor, x.root));
     const budget: CopyBudget = { bytes: 0, files: 0 };
-    copyTree(x.root, tmpRoot, budget, true);
-    for (const d of outside) copyTree(d, join(base, relative(ancestor, d)), budget, true);
-    if (existsSync(modulesDir)) copyTree(modulesDir, join(tmpRoot, ".terraform", "modules"), budget, false);
+    try {
+      copyTree(x.root, tmpRoot, budget, true);
+      for (const d of outside) copyTree(d, join(base, relative(ancestor, d)), budget, true);
+      if (existsSync(modulesDir)) copyTree(modulesDir, join(tmpRoot, ".terraform", "modules"), budget, false);
+    } catch (e) {
+      if (e instanceof SkipValidate) throw e;
+      throw new SkipValidate(
+        `could not copy the configuration (${(e as NodeJS.ErrnoException).code ?? String(e)}); validate skipped, schema comparison only`,
+      );
+    }
+    // The copy recreates symlinks, so a file written into it could land on the user's own file through
+    // a copied link: remove whatever is at the path first (rmSync unlinks a link, never its target).
+    const writeFresh = (path: string, text: string) => {
+      rmSync(path, { force: true });
+      writeFileSync(path, text, "utf8");
+    };
 
     // Provider packages as links: the user's installed ones, plus the target from the plugin cache.
     const providersDir = join(tmpRoot, ".terraform", "providers");
@@ -1300,11 +1358,11 @@ export async function validateComparison(x: ValidateInput): Promise<{ diff: Diag
         throw new SkipValidate(`terraform validate could not run: ${e instanceof Error ? e.message : String(e)}`);
       }
     };
-    writeFileSync(join(tmpRoot, ".terraform.lock.hcl"), lockText, "utf8");
+    writeFresh(join(tmpRoot, ".terraform.lock.hcl"), lockText);
     const b = await runValidate();
     const baseline = parseValidate(b.stdout, b.stderr);
 
-    writeFileSync(join(tmpRoot, ".terraform.lock.hcl"), replaceLockBlock(lockText, x.addr, x.targetLockBlock), "utf8");
+    writeFresh(join(tmpRoot, ".terraform.lock.hcl"), replaceLockBlock(lockText, x.addr, x.targetLockBlock));
     const rootUnit = x.units.find((u) => u.key === "");
     const local = rootUnit
       ? [...rootUnit.config.requiredProviders.values()].find((r) =>
@@ -1312,10 +1370,9 @@ export async function validateComparison(x: ValidateInput): Promise<{ diff: Diag
         )?.local
       : undefined;
     if (local) {
-      writeFileSync(
+      writeFresh(
         join(tmpRoot, "zz_tfcwd_upgrade_override.tf"),
         `terraform {\n  required_providers {\n    ${local} = {\n      source  = ${JSON.stringify(x.addr)}\n      version = ${JSON.stringify(x.targetVersion)}\n    }\n  }\n}\n`,
-        "utf8",
       );
     }
     const t = await runValidate();

@@ -4,7 +4,14 @@ import { loadModule, type ModuleCallDecl, type ModuleConfig, type VariableDecl }
 import { satisfies } from "./constraints.js";
 import type { HclValue } from "./hcl.js";
 import { moduleFiles } from "./hcl.js";
-import { hasSecretShape, isSecretKey, maskInlineSecrets, REDACTED_NAME } from "./redact.js";
+import {
+  hasSecretShape,
+  isSecretKey,
+  maskInlineSecrets,
+  maskUrlPasswords,
+  REDACTED_NAME,
+  REDACTED_SHAPE,
+} from "./redact.js";
 import { assertLocalPath } from "./schema.js";
 
 /**
@@ -190,6 +197,45 @@ function redactDefaultValue(v: unknown, underSecretKey: boolean): unknown {
   return v;
 }
 
+/** Query parameters that carry credentials in module sources (go-getter `sshkey`, S3/GCS presigned URLs). */
+const SECRET_QUERY_KEYS = new Set([
+  "sshkey",
+  "token",
+  "access_token",
+  "private_token",
+  "password",
+  "sig",
+  "signature",
+  "x-amz-signature",
+  "x-amz-credential",
+  "x-amz-security-token",
+  "x-goog-signature",
+  "x-goog-credential",
+  "aws_access_key_id",
+  "aws_access_key_secret",
+  "aws_access_token",
+]);
+
+/**
+ * A module source as printed: URL passwords and token-only http(s) userinfo
+ * (`https://TOKEN@host`) masked, secret query parameters masked, and a source
+ * still holding a secret-shaped value replaced whole. Comparison uses raw values.
+ */
+export function redactModuleSource(s: string): string {
+  let out = maskUrlPasswords(s) ?? s;
+  out = out.replace(/\b(https?:\/\/)[^\s:@/]+@/gi, "$1(redacted)@");
+  const q = out.indexOf("?");
+  if (q >= 0) {
+    const query = out
+      .slice(q + 1)
+      .replace(/(^|&)([^=&#\s]+)=([^&#\s]*)/g, (m, sep: string, key: string) =>
+        SECRET_QUERY_KEYS.has(key.toLowerCase()) || isSecretKey(key) ? `${sep}${key}=(redacted)` : m,
+      );
+    out = `${out.slice(0, q + 1)}${query}`;
+  }
+  return hasSecretShape(out) ? REDACTED_SHAPE : out;
+}
+
 const DEFAULT_CHARS = 80;
 
 function renderDefault(v: VariableDecl): string {
@@ -237,7 +283,7 @@ function callTarget(
     entry.Source !== undefined &&
     normalizeModuleSource(source) !== normalizeModuleSource(entry.Source)
   ) {
-    return `STALE: installed from ${entry.Source}, config says ${source}; run terraform init`;
+    return `STALE: installed from ${redactModuleSource(entry.Source)}, config says ${redactModuleSource(source)}; run terraform init`;
   }
   if (version !== undefined && entry.Version) {
     try {
@@ -283,7 +329,11 @@ export function renderModuleInterface(
   if (calls.length) {
     lines.push("module calls:");
     for (const c of calls) {
-      const src = c.source ? (c.source.kind === "literal" ? String(c.source.value) : `expr(${c.source.text})`) : "?";
+      const src = c.source
+        ? c.source.kind === "literal"
+          ? redactModuleSource(String(c.source.value))
+          : `expr(${redactModuleSource(c.source.text)})`
+        : "?";
       const ver = c.version
         ? ` version=${c.version.kind === "literal" ? String(c.version.value) : `expr(${c.version.text})`}`
         : "";

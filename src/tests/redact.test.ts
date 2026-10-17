@@ -90,6 +90,13 @@ describe("layer 4: value shapes", () => {
     `npm_${"A".repeat(36)}`,
     `sk-ant-${"a".repeat(30)}`,
     `AIza${"b".repeat(35)}`,
+    `hvs.${"C".repeat(24)}`,
+    `hvb.${"A".repeat(30)}`,
+    `hvr.${"b".repeat(22)}`,
+    `abcdefghijklmn.atlasv1.${"x".repeat(60)}`,
+    `sk_live_${"4".repeat(24)}`,
+    `rk_live_${"a".repeat(24)}`,
+    `sk_test_${"z".repeat(24)}`,
     // base64 of PEM private keys, as kubeconfig client-key-data holds them (all three alignments)
     Buffer.from("-----BEGIN RSA PRIVATE KEY-----\nMIIE").toString("base64"),
     Buffer.from("-----BEGIN PRIVATE KEY-----\nMIIE").toString("base64"),
@@ -103,6 +110,9 @@ describe("layer 4: value shapes", () => {
     "ghp_short",
     "plain text",
     "sk-1",
+    "hvs.short",
+    `pk_live_${"a".repeat(24)}`,
+    "registry.terraform.io/hashicorp/aws",
     Buffer.from("-----BEGIN CERTIFICATE-----\nMIID").toString("base64"),
     Buffer.from("-----BEGIN PUBLIC KEY-----\nMIIB").toString("base64"),
   ])("keeps %s", (s) => expect(hasSecretShape(s)).toBe(false));
@@ -137,6 +147,54 @@ describe("layer 4: value shapes", () => {
     expect(maskInlineSecrets("postgres://u:FIXTURE-plain-1@h/db?password=FIXTURE-plain-2")).toBe(
       "postgres://u:(redacted)@h/db?password=(redacted)",
     );
+  });
+
+  it("masks run-together and short credential keys, Bearer/Basic tokens and SAS sig=", () => {
+    expect(maskInlineCredentials("PGPASSWORD=FIXTURE-plain-10 psql")).toBe("PGPASSWORD=(redacted) psql");
+    expect(maskInlineCredentials("MYSQLPWD=FIXTURE-plain-11")).toBe("MYSQLPWD=(redacted)");
+    expect(maskInlineCredentials("export DB_PASS=FIXTURE-plain-12")).toBe("export DB_PASS=(redacted)");
+    expect(maskInlineCredentials("curl --pass=FIXTURE-plain-13")).toBe("curl --pass=(redacted)");
+    expect(maskInlineCredentials("https://a.blob.core.windows.net/c?sv=2022-11-02&sp=r&sig=FIXTURE-plain-14%3D")).toBe(
+      "https://a.blob.core.windows.net/c?sv=2022-11-02&sp=r&sig=(redacted)",
+    );
+    expect(maskInlineCredentials("Authorization: Bearer FIXTURE-plain-15")).not.toContain("FIXTURE-plain");
+    expect(maskInlineCredentials('curl -H "Authorization: Bearer FIXTURE-plain-16" h')).not.toContain("FIXTURE-plain");
+    expect(maskInlineCredentials("header Bearer FIXTURE-plain-17.abc")).toBe("header Bearer (redacted)");
+    expect(maskInlineCredentials("Basic dXNlcjpGSVhUVVJF")).toBe("Basic (redacted)");
+    // Not credentials: the bare word, "pass" inside another word, prose, sig-like params.
+    expect(maskInlineCredentials("enter the password")).toBeNull();
+    expect(maskInlineCredentials("bypass=true")).toBeNull();
+    expect(maskInlineCredentials("compass: north")).toBeNull();
+    expect(maskInlineCredentials("pass a bearer token in the header")).toBeNull();
+    expect(maskInlineCredentials("Enables basic monitoring")).toBeNull();
+    expect(maskInlineCredentials("Standard or Basic configuration")).toBeNull();
+    expect(maskInlineCredentials("Uses Bearer authentication")).toBeNull();
+    expect(maskInlineCredentials("nextpagetoken: abcdef")).toBeNull();
+    // A short token after the scheme in an Authorization header is still masked whole.
+    expect(maskInlineCredentials("Authorization: Bearer abc")).toBe("Authorization: (redacted)");
+    expect(maskInlineCredentials("https://h/x?signal=1&design=2")).toBeNull();
+  });
+
+  it("masks the value of a secret-named {name, value} pair in JSON held as a string", () => {
+    const defs = JSON.stringify([
+      {
+        name: "app",
+        environment: [
+          { name: "DB_PASSWORD", value: "FIXTURE-plain-18" },
+          { name: "LOG_LEVEL", value: "info" },
+          { value: "FIXTURE-plain-19", name: "api_token" },
+          { name: "SECRET_KEY", value: 'a\\"FIXTURE-plain-23' },
+        ],
+        secrets: [{ name: "X", valueFrom: "arn:aws:ssm:us-east-1:1:parameter/x" }],
+      },
+    ]);
+    const out = maskInlineCredentials(defs);
+    expect(out).not.toContain("FIXTURE-plain");
+    expect(out).toContain('{"name":"DB_PASSWORD","value":"(redacted)"}');
+    expect(out).toContain('{"name":"LOG_LEVEL","value":"info"}');
+    expect(out).toContain('{"value":"(redacted)","name":"api_token"}');
+    expect(out).toContain("arn:aws:ssm");
+    expect(maskInlineCredentials('[{"name":"LOG_LEVEL","value":"info"}]')).toBeNull();
   });
 });
 
@@ -230,6 +288,33 @@ describe("tf_show_resource rendering on the real fixture state", () => {
     expect(out).toContain("  rsa_bits = 2048");
     expect(out.split("\n").pop()).toBe("redacted: 3 marked sensitive by Terraform, 0 by name, 0 by value");
     expect(showResource(STATE, "tls_private_key.k", { ...OPTS, maxValueChars: 0 })).not.toContain("(+");
+  });
+
+  it("redacts the value of a {name, value} entry whose name is secret-like", () => {
+    const res: StateResource = {
+      address: "helm_release.db",
+      type: "helm_release",
+      values: {
+        set: [
+          { name: "postgresql.auth.password", value: "FIXTURE-plain-20", type: "string" },
+          { name: "replicaCount", value: "2" },
+        ],
+        env: [
+          { name: "DB_PASSWORD", value: "FIXTURE-plain-21", value_from: [] },
+          { key: "API_TOKEN", value: "FIXTURE-plain-22" },
+          { name: "password_length", value: "16" },
+        ],
+      },
+    };
+    const out = renderResource(res, new Set(), OPTS);
+    expect(out).not.toContain("FIXTURE-plain");
+    expect(out).toContain('  set[0].name = "postgresql.auth.password"');
+    expect(out).toContain("  set[0].value = (redacted: secret-like name)");
+    expect(out).toContain('  set[1].value = "2"');
+    expect(out).toContain("  env[0].value = (redacted: secret-like name)");
+    expect(out).toContain("  env[0].value_from = []");
+    expect(out).toContain("  env[1].value = (redacted: secret-like name)");
+    expect(out).toContain('  env[2].value = "16"');
   });
 
   it("every resource in the fixture renders with zero sentinel strings", () => {

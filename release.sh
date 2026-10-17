@@ -262,6 +262,11 @@ echo -e "${CYAN}Pre-flight checks...${NC}"
 
 command -v node >/dev/null || fail "node not installed"
 command -v npm >/dev/null  || fail "npm not installed"
+# jq syncs server.json's version in step 2; without it that step dies under
+# set -e mid-release, after the bump.
+if [ -f server.json ]; then
+  command -v jq >/dev/null || fail "jq not installed (needed to sync server.json)"
+fi
 # gh is only required in local mode -- CI uses GITHUB_TOKEN with the gh action.
 if [ "$IS_CI" != "true" ]; then
   command -v gh >/dev/null || fail "gh CLI not installed"
@@ -276,6 +281,32 @@ if [ "$IS_CI" != "true" ]; then
 fi
 
 CURRENT_VERSION=$(node -p "require('./package.json').version")
+
+# Clean tree, up to date with origin/main (the header's promise). A resume run
+# (package.json already at VERSION) may legitimately hold an uncommitted bump
+# (interrupted in step 2/3) or an unpushed bump commit (interrupted before
+# step 4), so on resume only the bump files may be dirty and HEAD may be ahead
+# of origin/main -- never behind or diverged.
+if [ "$IS_CI" != "true" ]; then
+  DIRTY=$(git status --porcelain)
+  if [ "$CURRENT_VERSION" = "$VERSION" ]; then
+    DIRTY=$(printf '%s\n' "$DIRTY" | grep -vE '^.. (package\.json|package-lock\.json|CHANGELOG\.md|server\.json)$' || true)
+  fi
+  if [ -n "$DIRTY" ]; then
+    fail "Working tree is not clean -- commit or stash first:
+$DIRTY"
+  fi
+  git fetch origin main || fail "git fetch origin main failed"
+  LOCAL_HEAD=$(git rev-parse HEAD)
+  ORIGIN_MAIN=$(git rev-parse origin/main)
+  if [ "$LOCAL_HEAD" != "$ORIGIN_MAIN" ]; then
+    if [ "$CURRENT_VERSION" = "$VERSION" ] && git merge-base --is-ancestor "$ORIGIN_MAIN" "$LOCAL_HEAD"; then
+      info "HEAD is ahead of origin/main (resuming an unpushed release)"
+    else
+      fail "main is not up to date with origin/main (HEAD $LOCAL_HEAD, origin/main $ORIGIN_MAIN) -- pull or rebase first"
+    fi
+  fi
+fi
 
 if [ "$CURRENT_VERSION" = "$VERSION" ]; then
   info "Resuming release v${VERSION}"

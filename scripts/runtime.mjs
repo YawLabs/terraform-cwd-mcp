@@ -41,6 +41,17 @@ const exeName = isWin ? "oam.exe" : "oam";
 const VERSION_PROBE_TIMEOUT_MS = 5_000;
 
 /**
+ * True when `--version` output carries oam's own banner ("oam 0.19.0" at the
+ * start of a line), the same test as the launcher's oamBanner. Answering
+ * `--version` is not enough: OAM_BIN pointing at node ("v22.x.y") would be
+ * accepted and the typecheck would run `node check .` and fail instead of
+ * falling back to tsc.
+ */
+function isOamBanner(text) {
+  return /^oam\s+\d+\.\d+\.\d+/m.test(text);
+}
+
+/**
  * The per-user locations oamjs.org's installers write to. Both forms are
  * checked on Windows: the installer defaults to %LOCALAPPDATA%\oam\bin there,
  * but oam's own docs name ~/.oam/bin first and OAM_INSTALL_DIR can put it
@@ -92,8 +103,9 @@ export function isBuildTreeBinary(p) {
 
 /**
  * Resolve an oam executable, or null when oam should not be used.
- * Verifies the binary actually runs -- a stale $OAM_BIN or a broken PATH entry
- * must degrade to Node rather than fail the typecheck.
+ * Verifies the binary actually runs and identifies as oam -- a stale $OAM_BIN,
+ * a broken PATH entry or a non-oam binary must degrade to Node rather than
+ * fail the typecheck.
  *
  * Returns `{ cmd, version, fromBuildTree }`. `fromBuildTree` is true when the
  * only oam available lives under `target/`; callers doing anything
@@ -124,6 +136,8 @@ export function findOam() {
         // `npm run typecheck` with no way out.
         timeout: VERSION_PROBE_TIMEOUT_MS,
       });
+      // Runs, but is not oam (node, some other tool on PATH): try the next one.
+      if (!isOamBanner(out)) continue;
       return { cmd, version: out.trim(), fromBuildTree: isBuildTreeBinary(cmd) };
     } catch {
       // Not executable, wrong arch, or a stale entry -- try the next candidate.
