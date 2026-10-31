@@ -80,7 +80,7 @@ describe("scripts/runtime.mjs describeRuntime()", () => {
 
   it("warns loudly about a cargo target/ binary and points at an installed one", () => {
     const value = probe(`process.stdout.write(JSON.stringify(describeRuntime(
-  { cmd: "/home/u/oam/target/release/oam", version: "oam 0.19.0", fromBuildTree: true },
+  { cmd: "/home/u/oam/target/release/oam", version: "oam 0.19.1", fromBuildTree: true },
 )));`);
     expect(value).toMatch(/WARNING/);
     expect(value).toMatch(/concurrent cargo build/);
@@ -92,22 +92,22 @@ describe("scripts/runtime.mjs describeRuntime()", () => {
 
   it("keeps a normal oam line clean of the build-tree warning", () => {
     const value = probe(`process.stdout.write(JSON.stringify(describeRuntime(
-  { cmd: "/home/u/.oam/bin/oam", version: "oam 0.19.0", fromBuildTree: false },
+  { cmd: "/home/u/.oam/bin/oam", version: "oam 0.19.1", fromBuildTree: false },
 )));`);
-    expect(value).toMatch(/oam 0\.19\.0/);
+    expect(value).toMatch(/oam 0\.19\.1/);
     expect(value).not.toMatch(/WARNING/);
   });
 });
 
 /**
- * TERRAFORM_CWD_MCP_RUNTIME=node must skip discovery, case-insensitively,
- * exactly as the launcher reads it (`=NODE` forces Node there). An exact
+ * TERRAFORM_CWD_MCP_RUNTIME=node must skip discovery, trimmed and
+ * case-insensitively, exactly as the launcher reads it (`=NODE` forces Node there). An exact
  * compare would make `=NODE` silently run the typecheck on oam the launcher
  * would have refused.
  *
  * `OAM_BIN` is the Node running the test, and a `--import` preload (the same
  * trick as launcher.test.ts's poseAsOam) makes runtime.mjs's `--version` probe
- * of it answer "oam 0.19.0": a runnable binary that identifies as oam, on every
+ * of it answer "oam 0.19.1": a runnable binary that identifies as oam, on every
  * platform, so `null` under RUNTIME=node is evidence the early return fired
  * rather than that nothing was found.
  */
@@ -119,7 +119,7 @@ const POSE_AS_OAM = [
       'import { syncBuiltinESMExports as poseSync } from "node:module";',
       "const poseReal = poseCp.execFileSync;",
       "poseCp.execFileSync = function (cmd, args, opts) {",
-      `  if (cmd === ${JSON.stringify(process.execPath)} && args?.[0] === "--version") return "oam 0.19.0\\n";`,
+      `  if (cmd === ${JSON.stringify(process.execPath)} && args?.[0] === "--version") return "oam 0.19.1\\n";`,
       "  return poseReal.call(this, cmd, args, opts);",
       "};",
       "poseSync();",
@@ -144,11 +144,16 @@ describe("scripts/runtime.mjs: RUNTIME=node skips discovery", () => {
   it("finds the OAM_BIN that answers with oam's banner when no runtime is forced (guards the case below)", () => {
     // Without this control, the assertion below could pass because OAM_BIN was
     // never accepted, not because discovery was skipped.
-    expect(probeWith("")).toEqual({ cmd: process.execPath, version: "oam 0.19.0", fromBuildTree: false });
+    expect(probeWith("")).toEqual({ cmd: process.execPath, version: "oam 0.19.1", fromBuildTree: false });
   });
 
   it("returns null without probing when the value is a non-lowercase 'node'", () => {
     expect(probeWith("NODE")).toBeNull();
+  });
+
+  it("returns null for a 'node' with surrounding whitespace (cmd.exe `set X=node && ...`)", () => {
+    expect(probeWith("node ")).toBeNull();
+    expect(probeWith(" Node\t")).toBeNull();
   });
 });
 

@@ -182,7 +182,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: runtime selection", () => {
   it("reads TERRAFORM_CWD_MCP_RUNTIME case-insensitively", async () => {
     const res = await runLauncher(["--version"], isolated({ TERRAFORM_CWD_MCP_RUNTIME: "OAM", OAM_BIN: MISSING_OAM }));
     expect(res.code).toBe(1);
-    expect(res.stderr).toContain("no usable oam (0.19.0 or newer) was found");
+    expect(res.stderr).toContain("no usable oam (0.19.1 or newer) was found");
   }, 30000);
 
   it("auto names an OAM_BIN that points at nothing, then falls back to Node", async () => {
@@ -200,7 +200,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: runtime selection", () => {
     const res = await runLauncher(["--version"], isolated({ TERRAFORM_CWD_MCP_RUNTIME: "oam", OAM_BIN: MISSING_OAM }));
     expect(res.code).toBe(1);
     expect(res.stdout).toBe("");
-    expect(res.stderr).toContain("no usable oam (0.19.0 or newer) was found");
+    expect(res.stderr).toContain("no usable oam (0.19.1 or newer) was found");
     expect(res.stderr).toContain("does not exist");
     // The remedy names the cause that was seen: a wrong OAM_BIN, not an install.
     expect(res.stderr).toContain("Point OAM_BIN at an existing oam binary, or unset it.");
@@ -216,7 +216,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: runtime selection", () => {
     // installed). Under `=oam` that is a hard failure, so the line prints.
     const res = await runLauncher(["--version"], isolated({ TERRAFORM_CWD_MCP_RUNTIME: "oam" }));
     expect(res.code).toBe(1);
-    expect(res.stderr).toContain("no usable oam (0.19.0 or newer) was found");
+    expect(res.stderr).toContain("no usable oam (0.19.1 or newer) was found");
     // The remedy must be the install line, not self-update or an OAM_BIN hint.
     expect(res.stderr).toMatch(/Install oam from https:\/\/oamjs\.org, or set OAM_BIN/);
     expect(res.stderr).not.toContain("self-update");
@@ -315,6 +315,12 @@ function loadRuntimePlan(): RuntimePlan {
   return new Function(`${pieces}\nreturn runtimePlan;`)() as RuntimePlan;
 }
 
+/** The REAL `runtimeMode` (TERRAFORM_CWD_MCP_RUNTIME -> mode), extracted the same way. */
+function loadRuntimeMode(): (raw: string | undefined) => string {
+  const pieces = extract([/function runtimeMode\(raw\) \{[\s\S]*?\n\}/]);
+  return new Function(`${pieces}\nreturn runtimeMode;`)() as (raw: string | undefined) => string;
+}
+
 /** The REAL `pickNewest`, extracted the same way, with the floor it closes over. */
 function loadPickNewest(): { pickNewest: PickNewest; floor: number[] } {
   const pieces = extract([OAM_MIN_DECL, ATLEAST_DECL, /function pickNewest\(candidates\) \{[\s\S]*?\n\}/]);
@@ -333,10 +339,10 @@ describe("launcher: runtimePlan()", () => {
     // SECOND oam. `auto` and `oam` both take the shortcut -- `oam` demands oam,
     // and the host already is one.
     //
-    // 0.19.0 pins the floor as inclusive, and 0.100.0 pins a numeric compare: it
-    // sorts BEFORE 0.19.0 as a string.
+    // 0.19.1 pins the floor as inclusive, and 0.100.0 pins a numeric compare: it
+    // sorts BEFORE 0.19.1 as a string.
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.19.0", "0.20.0", "0.100.0", "1.0.0", "0.20.0-dev"]) {
+      for (const hostOam of ["0.19.1", "0.20.0", "0.100.0", "1.0.0", "0.20.0-dev"]) {
         expect(runtimePlan({ mode, hostOam }), `mode=${mode} hostOam=${hostOam}`).toBe("in-process");
       }
     }
@@ -344,7 +350,8 @@ describe("launcher: runtimePlan()", () => {
 
   it("never serves in-process on a host oam below the floor", () => {
     for (const mode of ["auto", "oam"]) {
-      for (const hostOam of ["0.18.0", "0.17.0", "0.15.2", "0.9.0", "0.8.2", "0.0.1"]) {
+      // 0.19.0 and its -dev builds were the previous floor; they are below it now.
+      for (const hostOam of ["0.19.0", "0.19.0-dev", "0.18.0", "0.17.0", "0.15.2", "0.9.0", "0.8.2", "0.0.1"]) {
         expect(runtimePlan({ mode, hostOam }), `mode=${mode} hostOam=${hostOam}`).toBe("discover");
       }
     }
@@ -360,9 +367,26 @@ describe("launcher: runtimePlan()", () => {
     }
   });
 
+  it("reads TERRAFORM_CWD_MCP_RUNTIME trimmed and lowercased, so cmd.exe's 'node ' still forces Node", () => {
+    // `set TERRAFORM_CWD_MCP_RUNTIME=node && ...` in cmd.exe stores "node ".
+    // Untrimmed, that matched nothing and the escape hatch silently ran `auto`.
+    const runtimeMode = loadRuntimeMode();
+    expect(runtimeMode(undefined)).toBe("auto");
+    for (const [raw, want] of [
+      ["node ", "node"],
+      [" NODE\t", "node"],
+      ["Oam ", "oam"],
+      ["auto", "auto"],
+    ]) {
+      expect(runtimeMode(raw), JSON.stringify(raw)).toBe(want);
+    }
+    expect(runtimePlan({ mode: runtimeMode("node "), hostOam: undefined })).toBe("in-process");
+    expect(runtimePlan({ mode: runtimeMode("node "), hostOam: "0.19.1" })).toBe("handoff-node");
+  });
+
   it("runs TERRAFORM_CWD_MCP_RUNTIME=node on Node: in-process on a Node host, handed off from any oam host", () => {
     expect(runtimePlan({ mode: "node", hostOam: undefined })).toBe("in-process");
-    for (const hostOam of ["0.8.2", "0.19.0", "1.0.0", "dev"]) {
+    for (const hostOam of ["0.8.2", "0.19.1", "1.0.0", "dev"]) {
       expect(runtimePlan({ mode: "node", hostOam }), `hostOam=${hostOam}`).toBe("handoff-node");
     }
   });
@@ -373,24 +397,24 @@ describe("launcher: pickNewest()", () => {
   const at = (path: string, version: number[] | null): Candidate => ({ path, version });
 
   it("pins the floor to the latest oam release", () => {
-    expect(floor).toEqual([0, 19, 0]);
+    expect(floor).toEqual([0, 19, 1]);
   });
 
   it("takes the newest usable oam, not the first one found", () => {
     // The bug in caddy-mcp: discovery stopped at the first binary that existed,
     // so an older copy in an earlier location hid a newer one later.
-    const chosen = pickNewest([at("installed", [0, 19, 0]), at("path-a", [0, 20, 0]), at("path-b", [0, 19, 9])]);
+    const chosen = pickNewest([at("installed", [0, 19, 1]), at("path-a", [0, 20, 0]), at("path-b", [0, 19, 9])]);
     expect(chosen?.path).toBe("path-a");
   });
 
   it("compares numerically and keeps search order on a tie", () => {
     expect(pickNewest([at("a", [0, 20, 0]), at("b", [0, 100, 0])])?.path).toBe("b");
-    expect(pickNewest([at("first", [0, 19, 0]), at("second", [0, 19, 0])])?.path).toBe("first");
+    expect(pickNewest([at("first", [0, 19, 1]), at("second", [0, 19, 1])])?.path).toBe("first");
   });
 
   it("skips binaries below the floor or with no readable version", () => {
-    expect(pickNewest([at("old", [0, 18, 0]), at("broken", null), at("good", [0, 19, 0])])?.path).toBe("good");
-    expect(pickNewest([at("old", [0, 18, 0]), at("broken", null)])).toBeNull();
+    expect(pickNewest([at("old", [0, 19, 0]), at("broken", null), at("good", [0, 19, 1])])?.path).toBe("good");
+    expect(pickNewest([at("old", [0, 19, 0]), at("older", [0, 18, 0]), at("broken", null)])).toBeNull();
     expect(pickNewest([])).toBeNull();
   });
 });
@@ -461,7 +485,7 @@ describe("launcher: stripPermissionFlags()", () => {
  * outcomes unmistakable without a real oam, and cross-platform. In-process,
  * `--version` reaches dist/index.js and prints `terraform-cwd-mcp <version>`
  * with exit 0. On the discovery path, OAM_BIN is that pinned Node, the
- * preload makes the launcher's `--version` probe of it read "oam 0.19.0"
+ * preload makes the launcher's `--version` probe of it read "oam 0.19.1"
  * (the real `node --version` has no oam banner and would be passed over, see
  * "launcher: a non-oam OAM_BIN"), and the launcher spawns
  * `node run <entry> -- --version` -- which has no `run` subcommand, prints no
@@ -492,7 +516,7 @@ function runOnHost(
     'import { syncBuiltinESMExports as poseSync } from "node:module";',
     "const poseReal = poseCp.execFileSync;",
     "poseCp.execFileSync = function (cmd, args, opts) {",
-    `  if (cmd === ${JSON.stringify(process.execPath)} && args?.[0] === "--version") return "oam 0.19.0\\n";`,
+    `  if (cmd === ${JSON.stringify(process.execPath)} && args?.[0] === "--version") return "oam 0.19.1\\n";`,
     "  return poseReal.call(this, cmd, args, opts);",
     "};",
     "poseSync();",
@@ -535,7 +559,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: on an oam host", () => {
     async () => {
       const envs: Record<string, string>[] = [{}, { TERRAFORM_CWD_MCP_RUNTIME: "oam" }];
       for (const extraEnv of envs) {
-        const run = await runOnHost("0.19.0", extraEnv);
+        const run = await runOnHost("0.19.1", extraEnv);
         expect(servedVersion(run), `${JSON.stringify(extraEnv)} -> ${JSON.stringify(run)}`).toBe(true);
         expect(run.stderr).toMatch(IN_PROCESS_MARKER);
       }
@@ -546,8 +570,8 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: on an oam host", () => {
   it(
     "still discovers when the host oam is below the floor",
     async () => {
-      // 0.18.0: the release just below the floor.
-      const run = await runOnHost("0.18.0");
+      // 0.19.0: the release just below the floor.
+      const run = await runOnHost("0.19.0");
       expect(servedVersion(run), `a below-floor host must not shortcut, got ${JSON.stringify(run)}`).toBe(false);
       expect(run.code).not.toBe(0);
       expect(run.stderr).toMatch(HANDED_OFF_MARKER);
@@ -572,7 +596,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
       const run = await runOnHost("0.9.0", isolated({ OAM_BIN: MISSING_OAM }));
       expect(servedVersion(run), JSON.stringify(run)).toBe(true);
       expect(run.stderr).toMatch(
-        /this process is oam 0\.9\.0, older than 0\.19\.0, and no newer oam was found; running on .*node/,
+        /this process is oam 0\.9\.0, older than 0\.19\.1, and no newer oam was found; running on .*node/,
       );
       // Served by the child, not in the launcher process.
       expect(run.stderr).toMatch(HANDED_OFF_MARKER);
@@ -599,10 +623,10 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
       // Not an outdated oam -- Node was asked for outright, so self-update is
       // the wrong advice.
       const noNode = mkTemp("tfcwd-launcher-nopath-");
-      const run = await runOnHost("0.19.0", isolated({ PATH: noNode, TERRAFORM_CWD_MCP_RUNTIME: "node" }));
+      const run = await runOnHost("0.19.1", isolated({ PATH: noNode, TERRAFORM_CWD_MCP_RUNTIME: "node" }));
       expect(run.code, JSON.stringify(run)).toBe(1);
       expect(run.stdout.trim()).toBe("");
-      expect(run.stderr).toContain("TERRAFORM_CWD_MCP_RUNTIME=node on oam 0.19.0");
+      expect(run.stderr).toContain("TERRAFORM_CWD_MCP_RUNTIME=node on oam 0.19.1");
       expect(run.stderr).toContain("Put Node on PATH, or unset TERRAFORM_CWD_MCP_RUNTIME");
       expect(run.stderr).not.toContain("self-update");
     },
@@ -616,7 +640,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
       // spawns it with, because the Node running the LAUNCHER here would refuse
       // it the same way. --no-warnings is a Node flag and must survive.
       const run = await runOnHost(
-        "0.19.0",
+        "0.19.1",
         isolated({ TERRAFORM_CWD_MCP_RUNTIME: "node", OAM_BIN: MISSING_OAM }),
         `process.env.NODE_OPTIONS = "--permission --allow-net=localhost:2019 --allow-fs-read=/tmp --no-warnings";`,
       );
@@ -630,7 +654,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: with no usable oam", () => {
   it(
     "hands TERRAFORM_CWD_MCP_RUNTIME=node off to Node even on a supported oam host",
     async () => {
-      const run = await runOnHost("0.19.0", isolated({ TERRAFORM_CWD_MCP_RUNTIME: "node" }));
+      const run = await runOnHost("0.19.1", isolated({ TERRAFORM_CWD_MCP_RUNTIME: "node" }));
       expect(servedVersion(run), JSON.stringify(run)).toBe(true);
       expect(run.stderr).toMatch(HANDED_OFF_MARKER);
     },
@@ -662,7 +686,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: a non-oam OAM_BIN", () => {
     );
     expect(res.code).toBe(1);
     expect(res.stdout).toBe("");
-    expect(res.stderr).toContain("no usable oam (0.19.0 or newer) was found");
+    expect(res.stderr).toContain("no usable oam (0.19.1 or newer) was found");
     expect(res.stderr).toContain("Check that it is an executable oam binary for this platform.");
     expect(res.stderr).not.toContain("MODULE_NOT_FOUND");
   }, 30000);
@@ -702,7 +726,7 @@ describe.skipIf(!existsSync(DIST_CLI))("launcher: failed spawn on an oam host", 
       expect(servedVersion(run), `the Node fallback must still serve, got ${JSON.stringify(run)}`).toBe(true);
       expect(run.stderr).toMatch(/^terraform-cwd-mcp: failed to launch oam at .*; using Node instead\.$/m);
       expect(run.stderr).toMatch(
-        /this process is oam 0\.9\.0, older than 0\.19\.0, and the newer oam would not start; running on /,
+        /this process is oam 0\.9\.0, older than 0\.19\.1, and the newer oam would not start; running on /,
       );
       expect(run.stderr).toMatch(HANDED_OFF_MARKER);
     },
@@ -776,7 +800,7 @@ describe.skipIf(!isWin || !existsSync(DIST_CLI))("launcher: Windows PATH discove
  * requires >= OAM_MIN before it spawns. Shared by the POSIX-gated blocks below.
  * The fakes are bash scripts, which is also why those blocks skip on Windows.
  */
-const VERSION_PROBE = ['if [ "$1" = "--version" ]; then echo "oam 0.19.0"; exit 0; fi'];
+const VERSION_PROBE = ['if [ "$1" = "--version" ]; then echo "oam 0.19.1"; exit 0; fi'];
 
 /** Write an executable stand-in oam into `dir` (a fresh temp dir by default); returns its path. */
 function writeFake(body: string, dir = mkTemp("tfcwd-fake-oam-")): string {
@@ -820,8 +844,8 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: signal handling", () 
       isolated({ TERRAFORM_CWD_MCP_RUNTIME: "oam", OAM_BIN: writeFake(TOO_OLD) }),
     );
     expect(res.code).toBe(1);
-    expect(res.stderr).toContain("is oam 0.8.9, older than 0.19.0");
-    expect(res.stderr).toContain("Run `oam self-update` to get oam 0.19.0 or newer.");
+    expect(res.stderr).toContain("is oam 0.8.9, older than 0.19.1");
+    expect(res.stderr).toContain("Run `oam self-update` to get oam 0.19.1 or newer.");
     expect(res.stderr).not.toContain("https://oamjs.org");
   }, 30000);
 
@@ -885,7 +909,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: discovery", () => {
   }
 
   it("spawns the newest usable oam, not the first one found", async () => {
-    const env = withInstalledAndPath(fake("0.19.0", "installed"), fake("0.20.0", "path"), {
+    const env = withInstalledAndPath(fake("0.19.1", "installed"), fake("0.20.0", "path"), {
       TERRAFORM_CWD_MCP_RUNTIME: "oam",
     });
     const res = await runLauncher([], env);
@@ -896,14 +920,14 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: discovery", () => {
 
   it("finds an oam in OAM_INSTALL_DIR that is on neither PATH nor a default location", async () => {
     const installDir = mkTemp("tfcwd-install-dir-");
-    writeFake(fake("0.19.0", "install-dir"), installDir);
+    writeFake(fake("0.19.1", "install-dir"), installDir);
     const res = await runLauncher([], isolated({ TERRAFORM_CWD_MCP_RUNTIME: "oam", OAM_INSTALL_DIR: installDir }));
     expect(res.code, res.stderr).toBe(0);
     expect(res.stderr).toContain("CHILD: install-dir");
   }, 30000);
 
   it("keeps the installed copy on a tie", async () => {
-    const env = withInstalledAndPath(fake("0.19.0", "installed"), fake("0.19.0", "path"), {
+    const env = withInstalledAndPath(fake("0.19.1", "installed"), fake("0.19.1", "path"), {
       TERRAFORM_CWD_MCP_RUNTIME: "oam",
     });
     const res = await runLauncher([], env);
@@ -913,7 +937,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: discovery", () => {
   }, 30000);
 
   it("passes over a below-floor oam, installed or OAM_BIN, and says so", async () => {
-    const env = withInstalledAndPath(fake("0.18.0", "installed"), fake("0.19.0", "path"), {
+    const env = withInstalledAndPath(fake("0.19.0", "installed"), fake("0.19.1", "path"), {
       OAM_BIN: writeFake(fake("0.8.9", "override")),
     });
     const res = await runLauncher([], env);
@@ -921,7 +945,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: discovery", () => {
     expect(res.stderr).toContain("CHILD: path");
     expect(res.stderr).not.toMatch(/CHILD: (installed|override)/);
     expect(res.stderr).toMatch(
-      /^terraform-cwd-mcp: OAM_BIN=.* is oam 0\.8\.9, older than 0\.19\.0; using .*oam \(oam 0\.19\.0\)\.$/m,
+      /^terraform-cwd-mcp: OAM_BIN=.* is oam 0\.8\.9, older than 0\.19\.1; using .*oam \(oam 0\.19\.1\)\.$/m,
     );
   }, 30000);
 });
@@ -940,7 +964,7 @@ describe.skipIf(isWin || !existsSync(DIST_CLI))("launcher: version gate fallback
     expect(res.code, res.stderr).toBe(0);
     expect(res.stdout.trim()).toMatch(VERSION_LINE);
     expect(res.stderr).toContain("0.8.9");
-    expect(res.stderr).toContain("older than 0.19.0");
+    expect(res.stderr).toContain("older than 0.19.1");
     expect(res.stderr).toContain("using Node instead");
   }, 30000);
 

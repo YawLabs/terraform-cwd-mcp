@@ -207,11 +207,11 @@ All optional.
 **Runtime (oam or Node):**
 
 The `terraform-cwd-mcp` command prefers [oam](https://oamjs.org) when it finds a
-usable one and otherwise runs on Node. It never serves on an oam older than 0.19.0.
+usable one and otherwise runs on Node. It never serves on an oam older than 0.19.1.
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `TERRAFORM_CWD_MCP_RUNTIME` | `auto` | `auto`: the newest oam at 0.19.0 or newer, else Node. `oam`: oam or exit with an error. `node`: always Node -- the escape hatch when a problem only shows up under oam. |
+| `TERRAFORM_CWD_MCP_RUNTIME` | `auto` | `auto`: the newest oam at 0.19.1 or newer, else Node. `oam`: oam or exit with an error. `node`: always Node -- the escape hatch when a problem only shows up under oam. |
 | `OAM_BIN` | (unset) | Path to the oam binary to use. Otherwise the launcher checks `OAM_INSTALL_DIR`, the installed locations (`~/.oam/bin`, and `%LOCALAPPDATA%\oam\bin` on Windows) and `PATH`, and takes the newest. |
 
 An outdated oam is fixed with `oam self-update`. Under Yaw MCP, which runs servers

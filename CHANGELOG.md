@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The `terraform-cwd-mcp` command now requires oam 0.19.1 or newer (was
+  0.19.0); an older oam is passed over for Node, as before. Verified on oam
+  0.19.1 through the launcher: MCP handshake, `tf_module_interface`,
+  `tf_list_providers` and `tf_upgrade_impact` match Node, and a child spawned
+  with `TF_DATA_DIR` deleted does not see it.
+
+### Fixed
+- `TERRAFORM_CWD_MCP_RUNTIME` is trimmed as well as lowercased, in the launcher
+  and in `npm run typecheck`: cmd.exe's `set TERRAFORM_CWD_MCP_RUNTIME=node && ...`
+  stores `node `, which silently ran `auto` instead of forcing Node.
+- `npm run check:oam-floor` run from a junctioned or symlinked checkout no
+  longer exits 0 without checking anything: the main-module test now
+  realpaths both sides.
+
 ## [0.1.1] -- 2026-10-16
 
 ### Security

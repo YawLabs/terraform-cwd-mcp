@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -122,6 +122,24 @@ describe("check-oam-floor catches drift", () => {
     });
     const r = runChecker(root);
     expect(r.code, r.out).toBe(0);
+  });
+
+  it("still runs when invoked through a junctioned or symlinked scripts dir", () => {
+    // Node realpaths the main module's URL but not argv[1]; the old resolve()
+    // compare was false from a linked checkout, so main() never ran and the
+    // checker exited 0 in silence even on drift.
+    const linkParent = mkdtempSync(join(tmpdir(), "tfcwd-floor-link-"));
+    dirs.push(linkParent);
+    const link = join(linkParent, "scripts");
+    symlinkSync(join(REPO_ROOT, "scripts"), link, "junction");
+    const root = fixture({ launcherTest: "    expect(floor).toEqual([0, 15, 2]);\n" });
+    const r = spawnSync(process.execPath, [join(link, "check-oam-floor.mjs"), "--offline", "--root", root], {
+      encoding: "utf8",
+      timeout: 60_000,
+    });
+    const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+    expect(r.status, out).toBe(1);
+    expect(out).toMatch(/pins the floor at 0\.15\.2/);
   });
 
   it("fails loudly when OAM_MIN cannot be found at all", () => {
