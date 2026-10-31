@@ -9,12 +9,12 @@
     "id": "1420543229"
   },
   "websiteUrl": "https://yaw.sh/mcp-servers/terraform-cwd-mcp/",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@yawlabs/terraform-cwd-mcp",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "transport": {
         "type": "stdio"
       }
