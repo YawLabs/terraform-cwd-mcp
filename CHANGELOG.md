@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] -- 2026-11-15
+
 ### Changed
 - The `terraform-cwd-mcp` command now requires oam 0.20.2 or newer (was
   0.19.1); an older oam is passed over for Node, as before. Verified on oam
