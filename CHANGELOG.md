@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] -- 2026-11-16
+
 ### Security
 - `@hono/node-server` override raised to `^2.1.3` (was `^1.19.15`, inside the
   range of GHSA-rmxm-3fg6-px4f); it resolves to 2.1.8 and `npm audit` reports
