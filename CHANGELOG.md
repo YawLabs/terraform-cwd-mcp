@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `@modelcontextprotocol/sdk` range is `^1.32.2` (was `^1.32.1`), the range
   Yaw MCP 1.1.13 ships with.
 
+### Security
+- Lockfile-only `npm audit fix`: `body-parser` 2.4.0, `hono` 4.13.18,
+  `@hono/node-server` 1.19.19, `fast-uri` 3.1.9, `undici` 8.12.4 and
+  `vitest` / `@vitest/mocker` 4.1.12 (dev).
+
 ## [0.1.2] -- 2026-10-31
 
 ### Changed
