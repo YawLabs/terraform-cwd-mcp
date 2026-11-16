@@ -12,9 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.19.1); an older oam is passed over for Node, as before. Verified on oam
   0.20.2 through the launcher: MCP handshake, `tools/list`,
   `tf_module_interface`, `tf_list_providers` and `tf_upgrade_impact` match
-  Node, and a child spawned with `TF_DATA_DIR` deleted does not see it. From
-  oam 0.20.2 on, the `terraform` children the server starts with
-  `windowsHide` open hidden on Windows, as they do on Node.
+  Node, and a child spawned with `TF_DATA_DIR` deleted does not see it.
 - `@modelcontextprotocol/sdk` range is `^1.32.2` (was `^1.32.1`), the range
   Yaw MCP 1.1.13 ships with.
 
