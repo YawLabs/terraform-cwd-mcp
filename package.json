@@ -35,6 +35,7 @@
     "typecheck:tsc": "tsc --noEmit",
     "check:compliance": "node scripts/check-compliance.mjs",
     "check:oam-floor": "node scripts/check-oam-floor.mjs",
+    "check:yaw-mcp-floor": "node scripts/check-yaw-mcp-floor.mjs",
     "test:ci": "npm run build && npm test",
     "prepublishOnly": "npm run build",
     "prepare": "git config core.hooksPath .githooks 2>/dev/null || true",

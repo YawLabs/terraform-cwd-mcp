@@ -2,7 +2,7 @@
 
 [![Add to Yaw MCP](https://yaw.sh/yaw-mcp-button.svg)](https://yaw.sh/mcp/install?name=Terraform%20CWD&command=npx&args=-y%2C%40yawlabs%2Fterraform-cwd-mcp&description=Terraform%20working-dir%20truth%3A%20pinned%20provider%20schemas%2C%20plans%2C%20state%2C%20modules%2C%20upgrade%20impact&source=https%3A%2F%2Fgithub.com%2FYawLabs%2Fterraform-cwd-mcp)
 
-One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Or install manually below.
+One click adds this to your local Yaw MCP config so it's available in every Yaw Terminal session. Tested with Yaw MCP 1.1.13 or newer. Or install manually below.
 
 **What is actually true in THIS Terraform working directory: the exact provider schemas pinned in your `.terraform.lock.hcl` (so coding agents stop writing arguments that do not exist, were removed, or are read-only), plus your saved plans, your state (redacted), your local and installed modules, and what a provider upgrade would break.** It complements HashiCorp's [terraform-mcp-server](https://github.com/hashicorp/terraform-mcp-server) rather than replacing it: that server answers from the Terraform Registry docs, which describe the *latest* provider release; this one answers from `terraform providers schema -json` in your root module, which describes the version you actually *locked*. Run both.
 

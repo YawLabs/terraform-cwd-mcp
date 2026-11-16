@@ -317,7 +317,7 @@ fi
 if [ "$IS_CI" != "true" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
   echo ""
   echo -e "${YELLOW}About to release v${VERSION}. This will:${NC}"
-  echo "  1. Run lint, typecheck, build, tests, the oam floor check and the MCP compliance gate"
+  echo "  1. Run lint, typecheck, build, tests, the oam and Yaw MCP floor checks and the MCP compliance gate"
   echo "  2. Bump version in package.json"
   echo "  3. Commit, tag, and push"
   echo "  4. Publish to npm"
@@ -336,7 +336,7 @@ if [ "$IS_CI" != "true" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
 fi
 
 # Step 1: Lint, typecheck, build, test
-step 1 "Lint, typecheck, build, test, oam floor, compliance"
+step 1 "Lint, typecheck, build, test, oam and Yaw MCP floors, compliance"
 
 npm run lint || fail "Lint failed (run 'npm run lint:fix')"
 npm run typecheck || fail "Type check failed"
@@ -352,6 +352,19 @@ npm test || fail "Tests failed"
 # deliberate way past it. A machine with no network is not a failure -- the
 # check says so and continues.
 node scripts/check-oam-floor.mjs || fail "oam floor check failed -- see above. Set TERRAFORM_CWD_MCP_ALLOW_STALE_OAM=1 to release on the old floor deliberately."
+
+# The Yaw MCP floor: drift (YAW_MCP_MIN vs the README claim and the
+# @yawlabs/mcp-compliance devDependency) fails the release, and `npm test`
+# already ran that half (src/tests/yaw-mcp-floor.test.ts). A newer @yawlabs/mcp on
+# npm is only a WARNING -- nothing at runtime reads this floor -- so it prints
+# and the release continues. Offline it says so and passes.
+YAW_FLOOR_OUT=$(node scripts/check-yaw-mcp-floor.mjs 2>&1) || { echo "$YAW_FLOOR_OUT"; fail "Yaw MCP floor drift -- see above."; }
+echo "$YAW_FLOOR_OUT"
+if echo "$YAW_FLOOR_OUT" | grep -q "WARNING"; then
+  warn "Yaw MCP floor is behind the latest @yawlabs/mcp -- continuing"
+else
+  info "Yaw MCP floor has no drift"
+fi
 
 # MCP compliance gate, before anything is tagged. Yaw MCP grades every server it
 # fronts with @yawlabs/mcp-compliance and blocks one below its minimum, so a
