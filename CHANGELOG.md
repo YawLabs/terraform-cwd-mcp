@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- `@hono/node-server` override raised to `^2.1.3` (was `^1.19.15`, inside the
+  range of GHSA-rmxm-3fg6-px4f); it resolves to 2.1.8 and `npm audit` reports
+  0. The `hono`, `fast-uri`, `ip-address` and `qs` override floors are raised
+  to `^4.13.16`, `^3.1.9`, `^10.7.6` and `^6.17.1`.
+
 ## [0.1.3] -- 2026-11-15
 
 ### Changed
