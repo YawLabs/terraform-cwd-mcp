@@ -15,7 +15,7 @@
  * src/hcl.ts reads the tree-sitter-hcl grammar from ../vendor relative to
  * dist/. That is fine on both paths: oam resolves npm packages against an
  * existing node_modules and gives import.meta.url its file:// URL, so the
- * grammar path resolves the same way it does on Node. Verified on oam 0.19.1
+ * grammar path resolves the same way it does on Node. Verified on oam 0.20.2
  * through this launcher: an MCP handshake, tools/list, tf_module_interface (the
  * WASM parser), tf_list_providers (a terraform spawn with a large stdout) and
  * tf_upgrade_impact (temp-dir init, junctions, two validates, cleanup).
@@ -84,7 +84,7 @@
  * `--permission` is not wired up.
  *
  * MINIMUM OAM VERSION
- * The latest oam release, 0.19.1 -- bump OAM_MIN when oam ships a newer one.
+ * The latest oam release, 0.20.2 -- bump OAM_MIN when oam ships a newer one.
  * Only the current oam is used and verified; an older one is passed over.
  *
  * The floor is not cosmetic. The server runs terraform with an explicit child
@@ -96,7 +96,7 @@
  * semantics for SSH_AUTH_SOCK); 0.18.0 made an explicit `env` replace it, as
  * Node does. A resurrected TF_DATA_DIR would point the state commands at a
  * different workspace than the one the read-only guard checked. Re-measured on
- * 0.19.1: a child spawned with TF_DATA_DIR deleted does not see it.
+ * 0.20.2: a child spawned with TF_DATA_DIR deleted does not see it.
  *
  * SELECTION
  *   TERRAFORM_CWD_MCP_RUNTIME=auto   newest usable oam, else Node (default)
@@ -123,7 +123,7 @@ import { fileURLToPath } from "node:url";
  * environment (needed by every terraform spawn that deletes TF_DATA_DIR). See
  * MINIMUM OAM VERSION above.
  */
-const OAM_MIN = [0, 19, 1];
+const OAM_MIN = [0, 20, 2];
 
 /**
  * Bound on each `oam --version` probe. A healthy oam answers in milliseconds;
@@ -239,7 +239,7 @@ function parseVersion(text) {
 
 /**
  * `oam --version` output -> [major, minor, patch], or null unless it carries
- * oam's own banner ("oam 0.19.1" at the start of a line). Any x.y.z is NOT
+ * oam's own banner ("oam 0.20.2" at the start of a line). Any x.y.z is NOT
  * enough: an OAM_BIN (or an oam.exe on disk) that is really another program --
  * node prints "v22.22.2" -- would clear the floor, and the launcher would then
  * spawn `<it> run dist/index.js`, which dies with no Node fallback because the
