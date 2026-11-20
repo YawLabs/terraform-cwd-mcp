@@ -37,6 +37,7 @@ import { keyToAddress, readManifest } from "./module.js";
 import {
   assertInitialized,
   assertLocalPath,
+  type EnvProfile,
   KINDS,
   type Kind,
   type ProviderSchema,
@@ -322,8 +323,12 @@ function isLocalPath(p: string): boolean {
   }
 }
 
-/** The root plus every module in `.terraform/modules/modules.json` (local and downloaded). */
-export async function loadModules(root: string): Promise<ModuleUnit[]> {
+/**
+ * The root plus every module in `.terraform/modules/modules.json` (local and downloaded).
+ * The manifest is a file in the root, so its entries get the same directory check as
+ * `dir`: `assertAllowed` throws for one outside the directories this server may use.
+ */
+export async function loadModules(root: string, assertAllowed: (dir: string) => void): Promise<ModuleUnit[]> {
   const units: ModuleUnit[] = [{ key: "", address: "", dir: root, display: "", config: await loadModule(root) }];
   const manifest = readManifest(root) ?? [];
   // A manifest Dir that is a UNC/device path is skipped before any fs call.
@@ -332,6 +337,7 @@ export async function loadModules(root: string): Promise<ModuleUnit[]> {
     .sort((a, b) => (a.Key < b.Key ? -1 : a.Key > b.Key ? 1 : 0));
   for (const e of entries) {
     const dir = resolve(root, e.Dir);
+    assertAllowed(dir);
     if (!existsSync(dir)) continue;
     units.push({
       key: e.Key,
@@ -965,7 +971,7 @@ function atomicWrite(file: string, text: string): void {
   }
 }
 
-const TEMP_PREFIXES = ["tfcwd-upgrade-", "tfcwd-target-"];
+const TEMP_PREFIXES = ["tfcwd-upgrade-", "tfcwd-target-", "tfcwd-schema-", "tfcwd-state-"];
 
 /** Delete leftover temp dirs from crashed runs (older than `maxAgeMs`). Never follows links. */
 export function sweepStaleTempDirs(maxAgeMs = 3_600_000, base = tmpdir()): void {
@@ -999,9 +1005,10 @@ async function tempDirExec(
   cwd: string,
   env: Record<string, string | null>,
   what: string,
+  envProfile: EnvProfile = "scrubbed",
 ) {
   try {
-    return await store.exec(args, { cwd, env });
+    return await store.exec(args, { cwd, env, envProfile });
   } catch (e) {
     if (e instanceof TimeoutError) {
       throw new UpgradeInputError(
@@ -1076,6 +1083,8 @@ async function downloadTargetSchema(
       tmp,
       env,
       `downloading ${short} ${version}`,
+      // init only downloads; the schema dump below is what starts the plugin, and it stays scrubbed.
+      "download",
     );
     if (init.code !== 0)
       throw new UpgradeInputError(targetInitErrorMessage(init.stderr || init.stdout, addr, version, platform));
@@ -1284,13 +1293,12 @@ export async function validateComparison(x: ValidateInput): Promise<{ diff: Diag
   const lockText = readFileSync(join(x.root, ".terraform.lock.hcl"), "utf8");
   const manifest = readManifest(x.root) ?? [];
   const modulesDir = join(x.root, ".terraform", "modules");
-  const localDirs = manifest
-    .filter((e) => e.Key !== "" && isLocalPath(e.Dir))
-    .map((e) => resolve(x.root, e.Dir))
-    .filter((d) => {
-      const rel = relative(modulesDir, d);
-      return rel.startsWith("..") || isAbsolute(rel);
-    });
+  const manifestDirs = manifest.filter((e) => e.Key !== "" && isLocalPath(e.Dir)).map((e) => resolve(x.root, e.Dir));
+  for (const d of manifestDirs) x.store.assertAllowedDir(d);
+  const localDirs = manifestDirs.filter((d) => {
+    const rel = relative(modulesDir, d);
+    return rel.startsWith("..") || isAbsolute(rel);
+  });
   const outside = localDirs.filter((d) => {
     const rel = relative(x.root, d);
     return rel.startsWith("..") || isAbsolute(rel);
@@ -1424,6 +1432,12 @@ export function unresolvedProviderMessage(input: string, versions: Record<string
   return `${input} is not used by this configuration (not in .terraform.lock.hcl). tf_list_providers shows the pinned providers.`;
 }
 
+export const UPGRADE_DISABLED_MESSAGE =
+  "tf_upgrade_impact is disabled: it downloads the provider named in .terraform.lock.hcl and runs that plugin, and " +
+  "the lock file can be edited by whoever controls this directory. Nothing was downloaded or run. To enable it, " +
+  "set TERRAFORM_CWD_MCP_ALLOW_UPGRADE=1 in this server's environment (the MCP client's server configuration) and " +
+  "restart the server.";
+
 export function upgradeImpact(store: SchemaStore, opts: UpgradeOptions): Promise<string> {
   return serialized(async () => {
     const root = store.resolveRoot(opts.dir);
@@ -1440,10 +1454,12 @@ export function upgradeImpact(store: SchemaStore, opts: UpgradeOptions): Promise
     if (compareVersions(parseVersion(version)!, parseVersion(pinnedVersion)!) === 0) {
       return `${shortAddr(addr)} is already pinned at ${pinnedVersion}.`;
     }
+    if (!store.allowUpgrade) throw new UpgradeInputError(UPGRADE_DISABLED_MESSAGE);
+    // Before anything is downloaded: a manifest entry outside the allowed directories stops the tool.
+    const units = await loadModules(root, (d) => store.assertAllowedDir(d));
     const loaded = await store.load(root);
     const platform = await terraformPlatform(store, root);
     const target = await loadTargetSchema(store, addr, version, platform, opts.validate);
-    const units = await loadModules(root);
     const usage = usageFindings(
       units,
       addr,

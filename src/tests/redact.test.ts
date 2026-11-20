@@ -18,6 +18,45 @@ import { readFixtureJson } from "./helpers.js";
 const STATE = readFixtureJson<StateDoc>("state/state.json");
 const OPTS = { includeNull: false, maxValueChars: 200 };
 
+describe("redaction misses found in review", () => {
+  it("treats aws_sk and *_CRED keys as secret names", () => {
+    for (const k of ["aws_sk", "AWS_SK", "DB_CRED", "db_cred", "cred"]) expect(isSecretKey(k), k).toBe(true);
+    for (const k of ["sk", "sku", "credit", "sacred", "cred_id"]) expect(isSecretKey(k), k).toBe(false);
+  });
+
+  it("recognizes AWS access key IDs by shape, but not user or role IDs", () => {
+    expect(hasSecretShape("AKIAIOSFODNN7EXAMPLE")).toBe(true);
+    expect(hasSecretShape("key=ASIAIOSFODNN7EXAMPLE;")).toBe(true);
+    expect(hasSecretShape("AIDAIOSFODNN7EXAMPLE")).toBe(false);
+    expect(hasSecretShape("AROAIOSFODNN7EXAMPLE")).toBe(false);
+  });
+
+  it("masks the new names inside longer strings", () => {
+    expect(maskInlineCredentials("aws_sk=abc123 next")).toBe("aws_sk=(redacted) next");
+    expect(maskInlineCredentials("DB_CRED=abc123;x=1")).toBe("DB_CRED=(redacted);x=1");
+  });
+
+  it("tf_show_resource output hides all three", () => {
+    const out = renderResource(
+      {
+        address: "x_y.z",
+        type: "x_y",
+        values: {
+          access_key_id: "AKIAIOSFODNN7EXAMPLE",
+          aws_sk: "FIXTURE-plain-sk",
+          env: { DB_CRED: "FIXTURE-plain-cred" },
+        },
+      },
+      new Set(),
+      OPTS,
+    );
+    expect(out).not.toMatch(/AKIAIOSFODNN7EXAMPLE|FIXTURE-plain/);
+    expect(out).toContain(`access_key_id = ${REDACTED_SHAPE}`);
+    expect(out).toContain(`aws_sk = ${REDACTED_NAME}`);
+    expect(out).toContain(`env["DB_CRED"] = ${REDACTED_NAME}`);
+  });
+});
+
 describe("layer 3: key names", () => {
   it("tokenizes snake, kebab, dotted and camelCase keys", () => {
     expect(tokenizeKey("db_password")).toEqual(["db", "password"]);

@@ -140,6 +140,7 @@ describe("prepareState / workspace guard", () => {
     await showState(exec, ctx);
     expect(exec).toHaveBeenCalledTimes(3);
     for (const call of exec.mock.calls) expect(call[1].env).toEqual({ TF_DATA_DIR: null });
+    for (const call of exec.mock.calls) expect(call[1].envProfile).toBe("scrubbed");
   });
 
   it("accepts an existing non-default workspace", async () => {
@@ -162,7 +163,12 @@ describe("prepareState / workspace guard", () => {
 });
 
 describe("state commands", () => {
-  const ctx = (root = "/r") => ({ root, workspace: { name: "default", source: "default" as const }, backend: "local" });
+  const ctx = (root = "/r") => ({
+    root,
+    workspace: { name: "default", source: "default" as const },
+    backend: "local",
+    env: {},
+  });
 
   it("lists addresses, passes -id, and treats no state as a fact", async () => {
     const exec = mk((args) =>

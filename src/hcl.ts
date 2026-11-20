@@ -1,5 +1,5 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Language, type Node, Parser } from "web-tree-sitter";
 
@@ -572,13 +572,31 @@ export function moduleFiles(dir: string): { primary: string[]; override: string[
     .filter((n) => (n.endsWith(".tf") || n.endsWith(".tf.json")) && !isIgnoredFile(n))
     .filter((n) => {
       try {
-        return statSync(join(dir, n)).isFile();
+        if (!statSync(join(dir, n)).isFile()) return false;
+        // stat follows links, so a planted .tf symlink to a file OUTSIDE the module
+        // would otherwise be read and printed: tf_module_interface is the one tool that
+        // still claims readOnlyHint, so it must not turn into a file read primitive
+        // beyond the directory the operator allowed. A link that leaves the boundary is
+        // not a Terraform configuration file, it is an escape hatch -- skip it.
+        return !linkLeavesDir(dir, n);
       } catch {
         return false;
       }
     })
     .sort();
   return { primary: names.filter((n) => !isOverrideFile(n)), override: names.filter(isOverrideFile) };
+}
+
+/** True when `join(dir, name)` resolves (through links) to somewhere outside `dir`. */
+function linkLeavesDir(dir: string, name: string): boolean {
+  try {
+    const root = realpathSync(join(dir));
+    const target = realpathSync(join(dir, name));
+    return !target.startsWith(root.endsWith(sep) ? root : root + sep);
+  } catch {
+    // No real path (broken link, vanished): parseFile's read will fail anyway.
+    return false;
+  }
 }
 
 export async function parseFile(dir: string, name: string): Promise<ParsedFile> {

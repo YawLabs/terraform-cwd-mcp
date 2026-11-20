@@ -132,6 +132,7 @@ export function resolveModule(
   root: string,
   module: string | undefined,
   manifest: ManifestEntry[] | null,
+  assertAllowed: (dir: string) => void = () => {},
 ): ResolvedModule {
   if (module === undefined || module.trim() === "" || module.trim() === ".")
     return { dir: root, display: "(root)", key: "" };
@@ -146,11 +147,13 @@ export function resolveModule(
     }
     assertLocalPath(entry.Dir);
     const dir = resolve(root, entry.Dir);
+    assertAllowed(dir);
     return { dir, display: displayPath(root, dir), key };
   }
   assertLocalPath(module);
   const dir = resolve(root, module);
   assertLocalPath(dir);
+  assertAllowed(dir);
   const entry = manifest?.find((e) => resolve(root, e.Dir) === dir);
   return { dir, display: displayPath(root, dir), key: entry ? entry.Key : null };
 }
@@ -344,7 +347,12 @@ export function renderModuleInterface(
 }
 
 /** The whole tool: resolve, read, render. */
-export async function moduleInterface(root: string, module: string | undefined, descChars: number): Promise<string> {
+export async function moduleInterface(
+  root: string,
+  module: string | undefined,
+  descChars: number,
+  assertAllowed?: (dir: string) => void,
+): Promise<string> {
   let isDir = false;
   try {
     isDir = statSync(root).isDirectory();
@@ -354,7 +362,7 @@ export async function moduleInterface(root: string, module: string | undefined, 
   if (!isDir)
     throw new Error(`${root} does not exist or is not a directory. Pass \`dir\` as a Terraform root module path.`);
   const manifest = readManifest(root);
-  const resolved = resolveModule(root, module, manifest);
+  const resolved = resolveModule(root, module, manifest, assertAllowed);
   let files: { primary: string[]; override: string[] };
   try {
     files = moduleFiles(resolved.dir);

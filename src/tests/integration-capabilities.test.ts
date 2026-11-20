@@ -1,11 +1,12 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { satisfies } from "../constraints.js";
+import { UNVERIFIED_PLAN_NOTE } from "../plan.js";
 import { createTerraformExec, type ExecOptions, SchemaStore, type TerraformExec } from "../schema.js";
 import { createTerraformCwdServer } from "../server.js";
 import { listStateAddresses, prepareState } from "../state.js";
@@ -77,6 +78,14 @@ function snapshot(dir: string, skip = new Set([".terraform"])): string[] {
   return out.sort();
 }
 
+function stop(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((res) => {
+    child.once("exit", () => res());
+    child.kill();
+  });
+}
+
 const V1 = `terraform {
   required_providers {
     random = { source = "hashicorp/random", version = "3.6.3" }
@@ -142,7 +151,7 @@ describe.skipIf(!hasTerraform)("integration: plan, state and upgrade tools again
       const fromBinary = await client.callTool({ name: "tf_summarize_plan", arguments: { plan_file: "tfplan" } });
       const fromJson = await client.callTool({ name: "tf_summarize_plan", arguments: { plan_json: planJson } });
       expect(fromBinary.isError).toBeFalsy();
-      expect(textOf(fromBinary)).toBe(textOf(fromJson));
+      expect(`${textOf(fromBinary)}\n${UNVERIFIED_PLAN_NOTE}`).toBe(textOf(fromJson));
       const out = textOf(fromBinary);
       expect(out).toContain(`(terraform: ${planLine})`);
       expect(out).toContain("-/+ random_pet.p delete-then-create; forced by: length");
@@ -262,7 +271,7 @@ describe.skipIf(!hasTerraform)("integration: plan, state and upgrade tools again
     const countTemp = () => readdirSync(tmpdir()).filter((n) => n.startsWith("tfcwd-upgrade-")).length;
     const tempBefore = countTemp();
     const cacheDir = tempDir("tfcwd-it-cache-");
-    const store = new SchemaStore({ cacheDir, pluginCacheDir: pluginCache });
+    const store = new SchemaStore({ cacheDir, pluginCacheDir: pluginCache, allowUpgrade: true });
 
     const tls = await upgradeImpact(store, {
       provider: "hashicorp/tls",
@@ -329,7 +338,7 @@ describe.skipIf(!hasTerraform)("integration: plan, state and upgrade tools again
         ...opts,
         env: { ...opts.env, HTTPS_PROXY: "http://127.0.0.1:9", HTTP_PROXY: "http://127.0.0.1:9" },
       });
-    const offlineStore = new SchemaStore({ cacheDir, pluginCacheDir: pluginCache, exec: offline });
+    const offlineStore = new SchemaStore({ cacheDir, pluginCacheDir: pluginCache, exec: offline, allowUpgrade: true });
     const again = await upgradeImpact(offlineStore, {
       provider: "hashicorp/tls",
       version: "4.0.6",
@@ -338,6 +347,46 @@ describe.skipIf(!hasTerraform)("integration: plan, state and upgrade tools again
       includeUnused: false,
     });
     expect(again).toContain("validate on a temp copy, 4.0.6 vs 3.4.0: 2 new errors");
+  });
+
+  it("a remote-backend root: schema without the backend, state through a pulled copy", {
+    timeout: 120_000,
+  }, async () => {
+    // A loopback stand-in for the http backend, in its own process: `tf` below blocks this one.
+    const script =
+      'let s=null;require("http").createServer((q,r)=>{const b=[];q.on("data",d=>b.push(d));q.on("end",()=>{' +
+      'if(q.method==="POST"){s=Buffer.concat(b);r.end();}else if(s){r.end(s);}else{r.statusCode=404;r.end();}});})' +
+      '.listen(0,"127.0.0.1",function(){console.log(this.address().port);});';
+    const backend = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "inherit"] });
+    let client: Client | undefined;
+    try {
+      const port = await new Promise<string>((res) => backend.stdout!.once("data", (d) => res(String(d).trim())));
+      const root = tempDir("tfcwd-it-remote-");
+      writeFileSync(
+        join(root, "main.tf"),
+        `terraform {\n  backend "http" {\n    address = "http://127.0.0.1:${port}/state"\n  }\n}\nresource "terraform_data" "a" {\n  input = "hello"\n}\n`,
+      );
+      must(tf(root, ["init", "-input=false", "-no-color"]), "init");
+      must(tf(root, ["apply", "-auto-approve", "-input=false", "-no-color"]), "apply");
+      // Only the builtin provider is used, so terraform wrote no lock file; the init check wants one.
+      writeFileSync(join(root, ".terraform.lock.hcl"), "");
+      client = await connect({ cacheDir: tempDir(), defaultDir: root });
+      const shown = textOf(
+        await client.callTool({ name: "tf_show_resource", arguments: { address: "terraform_data.a" } }),
+      );
+      expect(shown).toContain('input = "hello"');
+      expect(textOf(await client.callTool({ name: "tf_state_addresses", arguments: {} }))).toContain(
+        "terraform_data.a",
+      );
+      // With the backend gone the schema tools still answer: they never touch it.
+      await stop(backend);
+      const types = await client.callTool({ name: "tf_search_types", arguments: { query: "terraform_data" } });
+      expect(types.isError).toBeFalsy();
+      expect(textOf(types)).toBe("terraform_data");
+    } finally {
+      await client?.close();
+      await stop(backend);
+    }
   });
 
   it("the constraint evaluator agrees with terraform init", { timeout: 600_000 }, async (ctx) => {
@@ -360,6 +409,102 @@ describe.skipIf(!hasTerraform)("integration: plan, state and upgrade tools again
       if (r.status !== 0 && /could not connect|discovery document|dial tcp/i.test(out))
         ctx.skip("registry unreachable");
       expect(r.status === 0, `${constraint}: ${out.slice(0, 300)}`).toBe(want);
+    }
+  });
+
+  it("real state and plans: secret keys stay hidden, forged names are refused, empty plans are accepted", {
+    timeout: 300_000,
+  }, async (ctx) => {
+    const root = tempDir("tfcwd-it-keys-");
+    writeFileSync(
+      join(root, "main.tf"),
+      `variable "multi" {
+  type      = string
+  sensitive = true
+  default   = "line1secret\\nline2secret"
+}
+variable "marked" {
+  type      = string
+  sensitive = true
+  default   = "marked-secret-value-1"
+}
+resource "terraform_data" "multi" {
+  for_each = toset([nonsensitive(var.multi)])
+  input    = var.multi
+}
+resource "terraform_data" "markedkey" {
+  for_each = toset([nonsensitive(var.marked)])
+  input    = var.marked
+}
+resource "terraform_data" "awskey" {
+  for_each = toset(["AKIAIOSFODNN7EXAMPLE"])
+  input    = "plain"
+}
+resource "terraform_data" "maps" {
+  input = {
+    AKIAIOSFODNN7EXAMPLE       = "under-aws-key"
+    (nonsensitive(var.marked)) = "under-marked-key"
+  }
+}
+`,
+    );
+    initOrSkip(ctx, root);
+    // Only the builtin provider: init creates neither of these, and the state tools require both.
+    mkdirSync(join(root, ".terraform"), { recursive: true });
+    writeFileSync(join(root, ".terraform.lock.hcl"), "", { flag: "a" });
+    must(tf(root, ["apply", "-auto-approve", "-input=false", "-no-color"]), "apply");
+    must(tf(root, ["plan", "-destroy", "-out=destroy.tfplan", "-input=false", "-no-color"]), "plan -destroy");
+    const client = await connect({ cacheDir: tempDir(), defaultDir: root, pluginCacheDir: pluginCache });
+    try {
+      const secrets = ["AKIAIOSFODNN7EXAMPLE", "marked-secret-value-1", "line1secret", "line2secret"];
+      const addrs = textOf(await client.callTool({ name: "tf_state_addresses", arguments: {} }));
+      expect(addrs.split("\n")).toEqual([
+        "4 addresses in workspace 'default' (backend local)",
+        'terraform_data.awskey["(redacted key)"]',
+        "terraform_data.maps",
+        'terraform_data.markedkey["(redacted key)"]',
+        'terraform_data.multi["(redacted key)"]',
+      ]);
+      const maps = textOf(
+        await client.callTool({ name: "tf_show_resource", arguments: { address: "terraform_data.maps" } }),
+      );
+      const plan = textOf(
+        await client.callTool({ name: "tf_summarize_plan", arguments: { plan_file: "destroy.tfplan" } }),
+      );
+      expect(plan).toContain('- terraform_data.multi["(redacted key)"]');
+      for (const secret of secrets) {
+        expect(addrs).not.toContain(secret);
+        expect(maps).not.toContain(secret);
+        expect(plan).not.toContain(secret);
+      }
+
+      const stateFile = join(root, "terraform.tfstate");
+      const state = JSON.parse(readFileSync(stateFile, "utf8"));
+      state.resources.find((r: { name: string }) => r.name === "maps").name =
+        "x\n  FORGED-STATE-LINE\nno_such.resource";
+      state.serial += 1;
+      writeFileSync(stateFile, JSON.stringify(state));
+      const forged = await client.callTool({ name: "tf_state_addresses", arguments: {} });
+      expect(forged.isError).toBe(true);
+      expect(textOf(forged)).not.toContain("FORGED-STATE-LINE");
+      expect(textOf(forged)).not.toContain("no_such.resource");
+    } finally {
+      await client.close();
+    }
+
+    const empty = tempDir("tfcwd-it-empty-");
+    writeFileSync(join(empty, "main.tf"), 'resource "terraform_data" "z" {\n  count = 0\n}\n');
+    initOrSkip(ctx, empty);
+    must(tf(empty, ["plan", "-out=p.tfplan", "-input=false", "-no-color"]), "plan");
+    const planJson = must(tf(empty, ["show", "-json", "-no-color", "p.tfplan"]), "show plan");
+    expect(JSON.parse(planJson)).not.toHaveProperty("resource_changes");
+    const emptyClient = await connect({ cacheDir: tempDir(), defaultDir: empty, pluginCacheDir: pluginCache });
+    try {
+      const out = textOf(await emptyClient.callTool({ name: "tf_summarize_plan", arguments: { plan_json: planJson } }));
+      expect(out).toContain("no changes");
+      expect(out).toContain(UNVERIFIED_PLAN_NOTE);
+    } finally {
+      await emptyClient.close();
     }
   });
 });

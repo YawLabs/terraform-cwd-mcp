@@ -199,8 +199,8 @@ describe("summarizePlan on hand-built plans", () => {
     expect(out).toContain("  +. a_x.f (new object created; the previous object is removed from state, NOT destroyed)");
     expect(out).toContain("  - a_x.dep (deposed object 00000001)");
     expect(out).toContain("  ? a_x.weird (unrecognized actions: frobnicate)");
-    // A deleted data source is not rendered or counted, like terraform's own output.
-    expect(out).not.toContain("a_d.gone");
+    // A removed data source is listed on its own and not counted, unlike a destroy.
+    expect(out).toContain("DATA SOURCE REMOVED (1)\n  - data.a_d.gone (dropped from state, nothing is destroyed)");
     // create,forget is not counted in terraform's "to add".
     expect(out).toContain("(terraform: 0 to add, 0 to change, 1 to destroy)");
   });
