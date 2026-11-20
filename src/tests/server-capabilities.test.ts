@@ -131,6 +131,7 @@ describe("server: plan, module, state and upgrade tools", () => {
   it("tf_state_addresses and tf_show_resource read state through terraform, redacted", async () => {
     const root = fixtureRoot();
     const exec = mkExec((args) => {
+      if (args[0] === "state" && args[1] === "pull") return okRun('{"version":4,"resources":[]}');
       if (args[0] === "state") return okRun("random_integer.n[0]\nrandom_integer.n[1]\nterraform_data.cfg\n");
       if (args[0] === "show") return okRun(readFixture("state/state.json"));
       return failRun("unexpected");
@@ -224,6 +225,7 @@ describe("server: plan, module, state and upgrade tools", () => {
       runner: vi.fn(async () => FIXTURE_TEXT),
       exec,
       pluginCacheDir: tempDir(),
+      allowUpgrade: true,
     });
     const res = await client.callTool({
       name: "tf_upgrade_impact",

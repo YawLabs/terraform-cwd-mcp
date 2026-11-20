@@ -7,7 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Terraform children no longer inherit the server's environment. Every command
+  that can start a provider plugin gets an allowlisted environment without
+  `AWS_*`, `TF_VAR_*`, `TF_TOKEN_*` or other credentials. `tf_show_resource`
+  renders pulled state without them, and the schema dump runs from a temp dir that
+  never touches the backend.
+- Remote backend reads get credentials only with
+  `TERRAFORM_CWD_MCP_ALLOW_BACKEND_CREDENTIALS=1`, and then only that backend's own
+  variables: backend configuration can run a command (`credential_process`) that
+  sees whatever terraform was given.
+- A `terraform` binary planted in the working directory is no longer run on Windows
+  when the MCP host has not set `NoDefaultCurrentDirectoryInExePath`, and relative
+  `PATH` entries are removed from the environment of terraform children.
+- `dir`, module paths and manifest entries, in `tf_module_interface` and
+  `tf_upgrade_impact`, are confined (links resolved) to the server's directory and
+  `TERRAFORM_CWD_MCP_ALLOWED_DIRS`; `plan_file` to `dir`.
+- `tf_upgrade_impact` requires `TERRAFORM_CWD_MCP_ALLOW_UPGRADE=1`.
+- `tf_summarize_plan` refuses plan JSON without a 1.x `format_version` and a valid
+  `resource_changes` list (unless the rest of the document shows a plan with no
+  resource instances) instead of reporting "no changes", and marks JSON input as
+  unverified. A delete with `mode: "data"` on a managed address is now a
+  delete. Addresses and other document strings are escaped, sensitive instance
+  keys are hidden (also when they hold escaped characters), and parse errors no
+  longer quote the input. An *empty* `resource_changes` list needs the same
+  corroboration as a missing one, so `[]` cannot hide a deletion; when the JSON
+  is the caller's, a data-source deletion says its mode and address were the
+  caller's claim, and a delete inside `deferred_changes` raises its own warning
+  (it is in no count otherwise).
+- `moduleFiles` skips a `.tf` symlink that resolves outside its module directory,
+  so read-only `tf_module_interface` cannot follow a planted link out of the
+  boundary, and state messages escape a workspace name forged through
+  `.terraform/environment` instead of printing it as its own line.
+- State tools hide map keys and instance keys that equal a sensitive value or look
+  like a secret, and `tf_state_addresses` refuses state whose resource names would
+  forge output lines.
+- Redaction also covers AWS access key IDs and `aws_sk` / `*_CRED` names. It is
+  described as best effort.
+
 ### Changed
+- **Breaking:** a `dir` outside the server's directory is refused; set
+  `TERRAFORM_CWD_MCP_DIR` or `TERRAFORM_CWD_MCP_ALLOWED_DIRS`. A relative `dir` now
+  resolves against the server's directory.
+- **Breaking:** a `plan_file` outside `dir` is refused; copy it into `dir`.
+- **Breaking:** `tf_upgrade_impact` is off by default.
+- **Breaking:** plan JSON without `format_version` is refused, and so is plan JSON
+  without `resource_changes` unless it has `configuration` and `planned_values` and
+  names no resource in them, `prior_state` or `resource_drift`.
+- **Breaking:** state tools on a remote backend no longer receive its credential or
+  proxy variables by default; set `TERRAFORM_CWD_MCP_ALLOW_BACKEND_CREDENTIALS=1` if
+  the backend needs them. Credentials Terraform finds without them keep working.
+- **Breaking:** `tf_upgrade_impact` fails when a `modules.json` entry is outside the
+  allowed directories; add it to `TERRAFORM_CWD_MCP_ALLOWED_DIRS`.
+- **Breaking:** `tf_state_addresses` prints hidden instance keys as `(redacted key)`,
+  and its `filter` matches the printed text. It also runs `terraform state pull`, and
+  `terraform show` (which starts plugins) when an address has a string key.
+  `tf_show_resource` accepts the printed form.
+- **Breaking:** a wrapper or plugin that relied on an inherited variable needs it
+  named in `TERRAFORM_CWD_MCP_PASS_ENV`.
+- Tools that start terraform no longer claim `readOnlyHint`, and declare
+  `openWorldHint`; only `tf_module_interface` is read-only. Clients may now ask for
+  approval before calling them.
+- Removed data sources are listed under `DATA SOURCE REMOVED` instead of omitted.
+- Schema tools work on a root initialized with `-backend=false` that has a backend
+  block, as the README always said.
 - The release pre-flight checks the Yaw MCP floor: `scripts/check-yaw-mcp-floor.mjs`
   (`npm run check:yaw-mcp-floor`) fails on drift between `YAW_MCP_MIN` 1.1.13, the
   README's "Yaw MCP 1.1.13 or newer" and the `@yawlabs/mcp-compliance` devDependency

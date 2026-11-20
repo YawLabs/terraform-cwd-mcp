@@ -13,16 +13,20 @@
  *    marked string anywhere in the document; a number equal to a marked number
  *    of >= 4 digits.
  * 3. Key names: a string, number or bool under a secret-like key (own or ancestor).
- * 4. Value shape: private keys (PEM, also base64-encoded), JWTs, well-known
- *    token prefixes; URL passwords, inline `password=...` credentials, `Bearer`
+ * 4. Value shape: private keys (PEM, also base64-encoded), JWTs, AWS access key
+ *    IDs, well-known token prefixes; URL passwords, inline `password=...` credentials, `Bearer`
  *    tokens, SAS `sig=` and secret-named `{"name","value"}` JSON pairs are
  *    masked in place.
+ *
+ * This is best effort: a secret with no marker, no telling name and no known
+ * shape is printed.
  */
 
 export const SENSITIVE = "(sensitive)";
 export const REDACTED_VALUE = "(redacted: contains a sensitive value)";
 export const REDACTED_NAME = "(redacted: secret-like name)";
 export const REDACTED_SHAPE = "(redacted: secret-like value)";
+export const REDACTED_KEY = "(redacted key)";
 
 // --- Layer 3: key names -----------------------------------------------------
 
@@ -38,6 +42,7 @@ const SECRET_TOKENS = new Set([
   "tokens",
   "apikey",
   "privatekey",
+  "cred",
   "credential",
   "credentials",
   "creds",
@@ -69,6 +74,7 @@ const SECRET_PAIRS = new Set([
   "shared key",
   "signing key",
   "encryption key",
+  "aws sk",
 ]);
 
 /** A key whose LAST token is one of these names metadata about a secret, not the secret. */
@@ -204,6 +210,7 @@ const SHAPES: RegExp[] = [
   /\bhv[sbr]\.[A-Za-z0-9_-]{20,}/, // Vault service / batch / recovery tokens
   /\b[A-Za-z0-9]{10,}\.atlasv1\.[A-Za-z0-9_-]{20,}/, // HCP Terraform / TFE API tokens
   /\b[rs]k_(live|test)_[A-Za-z0-9]{10,}/, // Stripe secret and restricted keys (pk_ is publishable)
+  /\b(AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b/, // AWS access key IDs (AIDA/AROA are user and role IDs, not credentials)
   // base64 of "-----BEGIN ... PRIVATE KEY" (kubeconfig client-key-data): the three alignments of "PRIVATE KEY".
   /LS0tLS1CRUdJTi[A-Za-z0-9+/=]{0,40}(UFJJVkFURSBLRVk|BSSVZBVEUgS0VZ|UklWQVRFIEtFW)/,
 ];
@@ -230,7 +237,7 @@ export function maskUrlPasswords(s: string): string | null {
  * counts as a whole token, so `bypass=` and `compass=` are left alone.
  */
 const INLINE_CREDENTIAL =
-  /\b((?:[a-z0-9]+[_-])*(?:[a-z0-9]*(?:password|passwd|pwd|secret)|token|pass|authorization|api[_-]?key|access[_-]?key|secret[_-]?key|account[_-]?key|shared[_-]?access[_-]?key|client[_-]?secret)["']?\s*[=:]\s*)((?:(?:bearer|basic)\s+)?(?:"[^"]*"|'[^']*'|[^;\s&"',]+))/gi;
+  /\b((?:[a-z0-9]+[_-])*(?:[a-z0-9]*(?:password|passwd|pwd|secret)|token|pass|cred|creds|credentials?|aws[_-]sk|authorization|api[_-]?key|access[_-]?key|secret[_-]?key|account[_-]?key|shared[_-]?access[_-]?key|client[_-]?secret)["']?\s*[=:]\s*)((?:(?:bearer|basic)\s+)?(?:"[^"]*"|'[^']*'|[^;\s&"',]+))/gi;
 
 /**
  * `Bearer <token>` / `Basic <creds>` (an Authorization header inside a string).
@@ -274,6 +281,40 @@ export function maskInlineSecrets(s: string): string | null {
   const url = maskUrlPasswords(s);
   const inline = maskInlineCredentials(url ?? s);
   return inline ?? url;
+}
+
+// --- Text from untrusted documents --------------------------------------------
+
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point
+const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
+
+/** Show control, line-separator, bidi and zero-width characters as `\uXXXX`, so text cannot forge output lines. */
+export function escapeUnsafeChars(s: string): string {
+  return s.replace(UNSAFE_CHARS, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/** A quoted instance key in a resource address, capturing its text as written. */
+export const ADDRESS_STRING_KEY = /\["((?:[^"\\]|\\.)*)"\]/g;
+
+/**
+ * The string an instance key stands for. Terraform writes keys as HCL quoted strings:
+ * backslash escapes (n, r, t, quote, backslash, uXXXX, UXXXXXXXX), and `$${` / `%%{`
+ * for a literal `${` / `%{`.
+ */
+export function decodeAddressKey(key: string): string {
+  return key.replace(
+    /\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|([\s\S]))|\$\$\{|%%\{/g,
+    (m, u4?: string, u8?: string, c?: string) => {
+      if (m === "$${") return "${";
+      if (m === "%%{") return "%{";
+      const hex = u4 ?? u8;
+      if (hex !== undefined) {
+        const code = Number.parseInt(hex, 16);
+        return code <= 0x10ffff ? String.fromCodePoint(code) : m;
+      }
+      return c === "n" ? "\n" : c === "r" ? "\r" : c === "t" ? "\t" : c!;
+    },
+  );
 }
 
 // --- Marker trees and the document-wide sensitive set ------------------------
@@ -409,6 +450,32 @@ export class Redactor {
   matchesSensitive(s: string): boolean {
     if (this.sensitive.has(s)) return true;
     return this.long.some((x) => s.includes(x));
+  }
+
+  /** Should this map key or instance key be hidden when it is printed? */
+  hidesKey(key: string): boolean {
+    return this.matchesSensitive(key) || hasSecretShape(key);
+  }
+
+  /** A resource address for output: sensitive instance keys hidden, unsafe characters escaped. */
+  address(address: string): string {
+    const shown = address.replace(ADDRESS_STRING_KEY, (m, key: string) =>
+      this.hidesKey(key) || this.hidesKey(decodeAddressKey(key)) ? `["${REDACTED_KEY}"]` : m,
+    );
+    return this.matchesSensitive(shown) ? "(redacted address)" : escapeUnsafeChars(shown);
+  }
+
+  /** A map key for output: `key`, or the placeholder (counted in the footer) when it must stay hidden. */
+  keyLabel(key: string): string {
+    if (this.matchesSensitive(key)) {
+      this.counts.value++;
+      return REDACTED_KEY;
+    }
+    if (hasSecretShape(key)) {
+      this.counts.shape++;
+      return REDACTED_KEY;
+    }
+    return key;
   }
 
   /**
