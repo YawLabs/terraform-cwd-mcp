@@ -368,14 +368,16 @@ export function renderAddresses(
   note?: string,
 ): string {
   if (addresses === null) return noStateMessage(ctx.workspace.name, ctx.backend);
+  // filter and id are echoed in the messages below: escaped like every other caller-supplied
+  // string here, so a newline in either cannot forge a whole output line.
+  const f = filter === undefined ? undefined : escapeUnsafeChars(filter);
+  const i = id === undefined ? undefined : escapeUnsafeChars(id);
   const hits = filter ? addresses.filter((a) => a.includes(filter)) : addresses;
   if (hits.length === 0) {
-    if (filter) return `no addresses match '${filter}'${id !== undefined ? ` with id '${id}'` : ""}`;
-    if (id !== undefined) return `no resource instance has id '${id}'`;
+    if (f) return `no addresses match '${f}'${i !== undefined ? ` with id '${i}'` : ""}`;
+    if (i !== undefined) return `no resource instance has id '${i}'`;
   }
-  const what = [filter ? `matching '${filter}'` : "", id !== undefined ? `with id '${id}'` : ""]
-    .filter(Boolean)
-    .join(" ");
+  const what = [f ? `matching '${f}'` : "", i !== undefined ? `with id '${i}'` : ""].filter(Boolean).join(" ");
   const head = `${hits.length} addresses${what ? ` ${what}` : ""} in workspace '${wsText(ctx.workspace.name)}' (backend ${ctx.backend})`;
   const more = hits.length > limit ? [`... ${hits.length - limit} more, narrow the filter`] : [];
   return [head, ...hits.slice(0, limit), ...more, ...(note ? [note] : [])].join("\n");
@@ -502,7 +504,9 @@ export function renderResource(res: StateResource, sensitive: Set<string>, opts:
   const deposed = res.deposed_key ? ` [deposed ${escapeUnsafeChars(res.deposed_key)}]` : "";
   const flags = `${deposed}${res.tainted ? " [tainted]" : ""}`;
   const provider = escapeUnsafeChars(shortProvider(res.provider_name));
-  const head = `${redactor.address(res.address)}${flags} (${kind}, ${provider}, schema v${res.schema_version ?? 0})`;
+  const head = `${redactor.address(res.address)}${flags} (${kind}, ${provider}, schema v${escapeUnsafeChars(
+    String(res.schema_version ?? 0),
+  )})`;
   const footer = redactor.footer();
   return [head, ...(lines.length ? lines : ["  (no attribute values)"]), ...(footer ? [footer] : [])].join("\n");
 }

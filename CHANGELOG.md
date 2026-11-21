@@ -30,11 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unverified. A delete with `mode: "data"` on a managed address is now a
   delete. Addresses and other document strings are escaped, sensitive instance
   keys are hidden (also when they hold escaped characters), and parse errors no
-  longer quote the input. An *empty* `resource_changes` list needs the same
-  corroboration as a missing one, so `[]` cannot hide a deletion; when the JSON
-  is the caller's, a data-source deletion says its mode and address were the
-  caller's claim, and a delete inside `deferred_changes` raises its own warning
-  (it is in no count otherwise).
+  longer quote the input. Every instance address `planned_values` or
+  `prior_state` names must be accounted for by a change, drift or deferred entry
+  (moves by `previous_address`), so removing, emptying or decoy-replacing the
+  change list cannot hide a resource; when the JSON is the caller's, a data-source
+  deletion says its mode and address were the caller's claim, and a delete inside
+  `deferred_changes` raises its own warning (it is in no count otherwise).
+- `tf_state_addresses` escapes the `filter` and `id` echoed in its messages, and
+  `tf_show_resource` escapes a forged `schema_version`, so neither can forge
+  output lines.
 - `moduleFiles` skips a `.tf` symlink that resolves outside its module directory,
   so read-only `tf_module_interface` cannot follow a planted link out of the
   boundary, and state messages escape a workspace name forged through

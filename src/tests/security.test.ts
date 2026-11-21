@@ -410,6 +410,32 @@ describe("forged and malformed plans", () => {
     ["bad drift", doc([], { resource_drift: [{}] }), /resource_drift\[0\] has no address/],
     ["bad outputs", doc([], { output_changes: { x: {} } }), /output_changes has an entry/],
     ["bad deferred", doc([], { deferred_changes: {} }), /deferred_changes is not an array/],
+    [
+      "invalid replace_paths",
+      doc([{ address: "a.b", change: { actions: ["delete"], replace_paths: "nope" } }]),
+      /has invalid change\.replace_paths/,
+    ],
+    ["action_invocations not an array", doc([], { action_invocations: {} }), /action_invocations is not an array/],
+    [
+      "configuration without root_module",
+      { format_version: "1.2", configuration: {}, planned_values: { root_module: {} } },
+      /no resource_changes/,
+    ],
+    [
+      "planned_values without root_module",
+      { format_version: "1.2", configuration: { root_module: {} }, planned_values: {} },
+      /no resource_changes/,
+    ],
+    [
+      "prior_state that is not an object",
+      {
+        format_version: "1.2",
+        configuration: { root_module: {} },
+        planned_values: { root_module: {} },
+        prior_state: "not-a-state",
+      },
+      /no resource_changes/,
+    ],
   ])("refuses %s", (_name, value, message) => {
     expect(refusal(value)).toMatch(message);
   });
@@ -828,6 +854,19 @@ describe("secrets in state keys and addresses", () => {
     expect(out).toContain('input = "plain"');
   });
 
+  it("escapes a forged schema_version in the header line", () => {
+    // schema_version is typed number but state JSON is parsed, not validated: a hand-edited
+    // value with a newline or control character must not forge whole output lines.
+    const forged = {
+      ...resource("terraform_data.x", { input: "v" }),
+      schema_version: "1\nFORGED-LINE" as unknown as number,
+    };
+    const out = renderResource(forged, new Set(), OPTS);
+    expect(out.split("\n")[0]).toContain("schema v1\\u000aFORGED-LINE");
+    expect(out).not.toContain("FORGED-LINE\n");
+    expect(out.split("\n").length).toBe(2); // header, value -- no forged extra line
+  });
+
   it("tf_state_addresses hides the same keys, and its filter cannot probe them", async () => {
     const listed = [`terraform_data.aws["${AWS_ID}"]`, `terraform_data.marked["${MARKED}"]`, "terraform_data.maps"];
     const { addresses, note } = await addressesForDisplay(execFor(okShow), ctx, listed);
@@ -869,11 +908,35 @@ describe("secrets in state keys and addresses", () => {
     expect(err).not.toContain("FORGED");
   });
 
+  it("refuses raw state whose module field forges the printed prefix", async () => {
+    // type and name pass STATE_NAME; only the module field check catches the newline
+    // that would forge whole `module.x.resource` lines in the listing.
+    const forged = JSON.stringify({
+      version: 4,
+      resources: [{ mode: "managed", type: "terraform_data", name: "x", module: "module.a\nFORGED" }],
+    });
+    const err = await addressesForDisplay(execFor(okShow, forged), ctx, ["a_b.x"]).catch((e: Error) => e.message);
+    expect(err).toMatch(/terraform\.tfstate\.backup/);
+    expect(err).not.toContain("FORGED");
+  });
+
   it("control characters in a state document's names cannot forge tf_show_resource lines", () => {
     const res = { ...resource("a_b.c", { "k FORGED": "v" }), type: "t\nFORGED", provider_name: "p\nFORGED" };
     const out = renderResource(res, new Set(), OPTS);
     for (const line of out.split("\n")) expect(line.startsWith("FORGED")).toBe(false);
     expect(out).not.toContain(" ");
+  });
+  it("escapes a forged filter or id echoed in the messages", () => {
+    const forged = "x\nFORGED-LINE";
+    const noMatch = renderAddresses([], ctx, forged, undefined, 10);
+    expect(noMatch.split("\n").length).toBe(1);
+    expect(noMatch).toContain("no addresses match 'x\\u000aFORGED-LINE'");
+    const idMiss = renderAddresses([], ctx, undefined, forged, 10);
+    expect(idMiss.split("\n").length).toBe(1);
+    expect(idMiss).toContain("id 'x\\u000aFORGED-LINE'");
+    // The head line echoes the filter on a hit too.
+    const head = renderAddresses(["a\nb"], ctx, "a\nb", undefined, 10).split("\n")[0]!;
+    expect(head).toContain("matching 'a\\u000ab'");
   });
 });
 
@@ -960,8 +1023,89 @@ describe("regression: forgery, containment and output-forging fixes", () => {
       }),
     );
     expect(r.kind).toBe("refuse");
-    expect((r as { message: string }).message).toMatch(/empty resource_changes list/);
+    expect((r as { message: string }).message).toMatch(/does not account for 1 instance address/);
     expect((r as { message: string }).message).not.toContain("no changes");
+  });
+
+  it("refuses a decoy no-op replacing the real change list", () => {
+    // The address-subset invariant: deleting one resource's entry (here swapped for an
+    // unrelated no-op) still leaves the resource in planned_values/prior_state, and the
+    // summary would have reported "no changes" over a plan that has them.
+    const r = detectPlanJson(
+      plan({
+        planned_values: { root_module: { resources: [{ address: "aws_instance.b" }] } },
+        prior_state: { values: { root_module: { resources: [{ address: "aws_instance.b" }] } } },
+        resource_changes: [
+          {
+            address: "aws_instance.unrelated",
+            mode: "managed",
+            type: "aws_instance",
+            name: "unrelated",
+            change: { actions: ["no-op"] },
+          },
+        ],
+      }),
+    );
+    expect(r.kind).toBe("refuse");
+    expect((r as { message: string }).message).toMatch(/does not account for 1 instance address.*aws_instance\.b/);
+    expect((r as { message: string }).message).not.toContain("no changes");
+  });
+
+  it("refuses a prior_state that is not the document Terraform writes", () => {
+    const r = detectPlanJson(plan({ prior_state: { format_version: "1.0" } }));
+    expect(r.kind).toBe("refuse");
+    expect((r as { message: string }).message).toMatch(/no resource_changes.*not a consistently empty plan/);
+  });
+
+  it("accepts an address accounted for only by resource_drift", () => {
+    // Drift entries are read by the summary, so they discharge the subset check; refusing
+    // one here would break plans HCP supplies where a resource appears only in drift.
+    const r = detectPlanJson(
+      plan({
+        planned_values: { root_module: { resources: [{ address: "aws_instance.b" }] } },
+        resource_changes: [],
+        resource_drift: [{ address: "aws_instance.b", change: { actions: ["update"] } }],
+      }),
+    );
+    expect(r.kind).toBe("plan");
+  });
+
+  it("accepts an address accounted for only by a deferred change", () => {
+    const r = detectPlanJson(
+      plan({
+        planned_values: { root_module: { resources: [{ address: "aws_instance.b" }] } },
+        resource_changes: [],
+        deferred_changes: [
+          {
+            reason: "provider_config_unknown",
+            resource_change: { address: "aws_instance.b", change: { actions: ["create"] } },
+          },
+        ],
+      }),
+    );
+    expect(r.kind).toBe("plan");
+  });
+
+  it("accepts an old address accounted for only by previous_address", () => {
+    // A move lists the new address as the change's address; prior_state may still name the
+    // old one, which only previous_address discharges.
+    const r = detectPlanJson(
+      plan({
+        prior_state: { values: { root_module: { resources: [{ address: "a.old" }] } } },
+        resource_changes: [{ address: "a.new", previous_address: "a.old", change: { actions: ["no-op"] } }],
+      }),
+    );
+    expect(r.kind).toBe("plan");
+  });
+
+  it("truncates the refusal list at five addresses and counts the rest", () => {
+    const many = ["a", "b", "c", "d", "e", "f"].map((n) => ({ address: `aws_x.${n}` }));
+    const r = detectPlanJson(plan({ planned_values: { root_module: { resources: many } }, resource_changes: [] }));
+    expect(r.kind).toBe("refuse");
+    const msg = (r as { message: string }).message;
+    expect(msg).toMatch(/does not account for 6 instance address\(es\)/);
+    expect(msg).toMatch(/aws_x\.a, aws_x\.b, aws_x\.c, aws_x\.d, aws_x\.e \(\+1 more\)/);
+    expect(msg).not.toContain("aws_x.f");
   });
 
   it("still accepts resource_changes: [] when the whole plan really is empty", () => {

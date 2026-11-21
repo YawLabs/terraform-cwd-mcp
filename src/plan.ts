@@ -56,26 +56,75 @@ function resourceChangeProblem(v: unknown): string | null {
   return null;
 }
 
-/** True when a `{ resources, child_modules }` tree holds at least one resource. */
-function moduleHasResources(m: unknown): boolean {
-  if (!isObj(m)) return false;
-  if (Array.isArray(m.resources) && m.resources.length > 0) return true;
-  return Array.isArray(m.child_modules) && m.child_modules.some(moduleHasResources);
+/** Every `address` in a `{ resources, child_modules }` tree (Terraform's plan shapes). */
+function collectAddresses(m: unknown, out: Set<string>): void {
+  if (!isObj(m)) return;
+  if (Array.isArray(m.resources))
+    for (const r of m.resources) if (isObj(r) && typeof r.address === "string") out.add(r.address);
+  if (Array.isArray(m.child_modules)) for (const c of m.child_modules) collectAddresses(c, out);
+}
+
+/**
+ * The instance addresses a doc claims exist (planned now, or existing before), from
+ * `planned_values` and `prior_state.values` -- both always written by Terraform.
+ */
+function claimedAddresses(o: Record<string, unknown>): Set<string> {
+  const out = new Set<string>();
+  if (isObj(o.planned_values)) collectAddresses(o.planned_values.root_module, out);
+  if (o.prior_state !== undefined && isObj(o.prior_state) && isObj(o.prior_state.values))
+    collectAddresses(o.prior_state.values.root_module, out);
+  return out;
+}
+
+/** Every address the document accounts for with a change, a drift entry or a deferred change. */
+function listedAddresses(o: Record<string, unknown>): Set<string> {
+  const out = new Set<string>();
+  const add = (l: unknown) => {
+    if (!Array.isArray(l)) return;
+    for (const rc of l)
+      if (isObj(rc)) {
+        if (typeof rc.address === "string") out.add(rc.address);
+        if (typeof rc.previous_address === "string") out.add(rc.previous_address);
+      }
+  };
+  add(o.resource_changes);
+  add(o.resource_drift);
+  if (Array.isArray(o.deferred_changes))
+    for (const d of o.deferred_changes)
+      if (isObj(d) && isObj(d.resource_change) && typeof d.resource_change.address === "string")
+        out.add(d.resource_change.address);
+  return out;
 }
 
 /**
  * Terraform omits resource_changes when no resource instance exists before or after
- * the plan: no resources at all, `count = 0`, an empty `for_each`. Such a document
- * is accepted only when the rest of it agrees: a configuration, planned values with
- * no resources, and no prior state or drift naming any. Everything else without the
+ * the plan: no resources at all, `count = 0` (the resource stays DECLARED in
+ * configuration, so declarations prove nothing), an empty `for_each`. The document
+ * counts as consistently empty only when every section agrees there are no instances
+ * at all: configuration and planned_values root modules present (Terraform always
+ * writes both), no address anywhere in planned_values or prior_state, a sane
+ * prior_state (it always carries `values`) and no drift. Everything else without the
  * list could be a real plan with its changes removed.
  */
 function isConsistentEmptyPlan(o: Record<string, unknown>): boolean {
-  if (!isObj(o.configuration) || !isObj(o.planned_values)) return false;
-  if (moduleHasResources(o.planned_values.root_module)) return false;
-  if (isObj(o.prior_state) && isObj(o.prior_state.values) && moduleHasResources(o.prior_state.values.root_module))
-    return false;
+  if (!isObj(o.configuration) || !isObj(o.configuration.root_module)) return false;
+  if (!isObj(o.planned_values) || !isObj(o.planned_values.root_module)) return false;
+  if (claimedAddresses(o).size > 0) return false;
+  // A prior_state without `values` is not the document Terraform writes; treat it as
+  // uncorroborated rather than letting a forged shell pass as an empty state.
+  if (o.prior_state !== undefined && (!isObj(o.prior_state) || !isObj(o.prior_state.values))) return false;
   return !(Array.isArray(o.resource_drift) && o.resource_drift.length > 0);
+}
+
+/**
+ * Addresses `planned_values` or `prior_state` claim exist that no change, drift or
+ * deferred entry accounts for. A real plan lists every instance in state or in the
+ * plan (moves appear as `previous_address`), so anything left is a document whose
+ * change list was edited: refuse it rather than summarize a partial truth.
+ */
+function unaccountedAddresses(o: Record<string, unknown>): string[] {
+  const listed = listedAddresses(o);
+  return [...claimedAddresses(o)].filter((a) => !listed.has(a));
 }
 
 /**
@@ -129,22 +178,24 @@ function validatePlanDoc(o: Record<string, unknown>, renderedByTerraform: boolea
   if (o.action_invocations !== undefined && !Array.isArray(o.action_invocations)) {
     return refuse("action_invocations is not an array.");
   }
-  // `resource_changes: []` says what an absent list says, so it needs the same
-  // corroboration the absent key gets above. A forger who writes [] instead of deleting
-  // the key used to skip that check (it only runs when the key is MISSING) and get a
-  // clean "no changes" while planned_values still named the resource it deleted. Checked
-  // last so a structurally broken document still reports its own first problem.
-  if (
-    !renderedByTerraform &&
-    Array.isArray(o.resource_changes) &&
-    o.resource_changes.length === 0 &&
-    !isConsistentEmptyPlan(o)
-  ) {
-    return refuse(
-      "it has an empty resource_changes list while planned_values, prior_state or resource_drift still names a " +
-        "resource, which Terraform never produces (it drops the whole list only when the plan is genuinely " +
-        "empty).",
-    );
+  // Every instance address planned_values or prior_state names must appear somewhere the
+  // summary reads (resource_changes, resource_drift or deferred_changes, plus
+  // previous_address for moves). A forger who deletes one resource's entry -- whether by
+  // removing the key, writing [] or replacing the list with a decoy no-op -- still leaves
+  // the resource visible in the values, and the summary would report "no changes" over a
+  // plan that has them. Checked last so a structurally broken document reports its own
+  // first problem; `renderedByTerraform` output is Terraform's own statement and is trusted.
+  if (!renderedByTerraform) {
+    const missing = unaccountedAddresses(o);
+    if (missing.length > 0) {
+      const shown = missing.slice(0, 5).join(", ");
+      const more = missing.length > 5 ? ` (+${missing.length - 5} more)` : "";
+      return refuse(
+        `resource_changes does not account for ${missing.length} instance address(es) that planned_values or ` +
+          `prior_state still names: ${shown}${more}. A Terraform plan lists every instance that exists before or ` +
+          "after it, so an entry was removed from the change list to hide it.",
+      );
+    }
   }
   return { kind: "plan", doc: o as PlanDoc };
 }
