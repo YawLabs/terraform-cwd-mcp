@@ -1,8 +1,19 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /** Tool-facing kind -> the key `terraform providers schema -json` files it under. */
 export const KINDS = {
@@ -97,6 +108,43 @@ export function defaultPluginCacheDir(cacheDir: string, env: NodeJS.ProcessEnv =
 
 export function defaultRootDir(env: NodeJS.ProcessEnv = process.env): string {
   return env.TERRAFORM_CWD_MCP_DIR || process.cwd();
+}
+
+/**
+ * Extra directories tools may use, from TERRAFORM_CWD_MCP_ALLOWED_DIRS (separated
+ * like PATH). Operator configuration: no tool parameter can change it.
+ */
+export function parseAllowedDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+  return (env.TERRAFORM_CWD_MCP_ALLOWED_DIRS ?? "")
+    .split(delimiter)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => {
+      assertLocalPath(p);
+      return resolve(p);
+    });
+}
+
+/** Resolve symlinks and junctions; a part that does not exist yet is kept as written. */
+function canonicalPath(p: string): string {
+  const tail: string[] = [];
+  let cur = p;
+  for (;;) {
+    try {
+      return join(realpathSync.native(cur), ...tail);
+    } catch {
+      const up = dirname(cur);
+      if (up === cur) return p;
+      tail.unshift(basename(cur));
+      cur = up;
+    }
+  }
+}
+
+/** True when `child` is `parent` or below it, after resolving links in both. */
+export function isInsideDir(parent: string, child: string): boolean {
+  const rel = relative(canonicalPath(parent), canonicalPath(child));
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 /** setTimeout clamps anything above 2^31-1 ms to 1 ms, which would kill terraform at once. */
@@ -198,10 +246,24 @@ export interface RunResult {
   stderr: string;
 }
 
+/**
+ * What a terraform child inherits. `scrubbed` (the default) is for every command
+ * that may start a provider plugin; `download` adds proxy settings and host-scoped
+ * registry tokens for `terraform init` in a temp dir; `backend` is for commands that
+ * read a remote backend and start no plugin. It equals `scrubbed` unless the operator
+ * set TERRAFORM_CWD_MCP_ALLOW_BACKEND_CREDENTIALS=1, because backend configuration
+ * can itself run a command (an AWS `credential_process`, a kubernetes `exec`), and
+ * then adds only the variables of that backend type (`BACKEND_ENV`).
+ */
+export type EnvProfile = "scrubbed" | "download" | "backend";
+
 export interface ExecOptions {
   cwd: string;
-  /** Extra environment entries; `null` removes a variable from the inherited environment. */
+  /** Extra environment entries; `null` removes a variable from the environment. */
   env?: Record<string, string | null>;
+  envProfile?: EnvProfile;
+  /** Backend type for the `backend` profile: selects which credential variables it adds. */
+  backend?: string;
   timeoutMs?: number;
 }
 
@@ -215,14 +277,120 @@ export type TerraformExec = (args: string[], opts: ExecOptions) => Promise<RunRe
 /** Cap on how much stderr is kept for the error message; stdout is never capped. */
 const STDERR_CAP = 64 * 1024;
 
+/** OS and locale variables terraform and its plugins need to start; none of them holds a credential by design. */
+const BASE_ENV = new Set([
+  "PATH",
+  "PATHEXT",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "USERNAME",
+  "USERPROFILE",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "PROGRAMDATA",
+  "PROGRAMFILES",
+  "PROGRAMFILES(X86)",
+  "PROGRAMW6432",
+  "SYSTEMROOT",
+  "SYSTEMDRIVE",
+  "WINDIR",
+  "COMSPEC",
+  "OS",
+  "PROCESSOR_ARCHITECTURE",
+  "NUMBER_OF_PROCESSORS",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "LANG",
+  "LANGUAGE",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "TERM",
+  "XDG_CONFIG_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_DATA_HOME",
+  "TF_CLI_CONFIG_FILE",
+  "TF_PLUGIN_CACHE_DIR",
+  "TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE",
+  "TF_DATA_DIR",
+  "TF_WORKSPACE",
+]);
+
+const DOWNLOAD_ENV = new Set(["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR"]);
+
+/** The variables each remote backend reads. A type not listed here gets none. */
+const BACKEND_ENV: Record<string, RegExp> = {
+  s3: /^AWS_/,
+  gcs: /^(GOOGLE_|GCLOUD_|CLOUDSDK_)/,
+  azurerm: /^(ARM_|AZURE_|MSI_|IDENTITY_ENDPOINT$|IDENTITY_HEADER$|ACTIONS_ID_TOKEN_REQUEST_)/,
+  remote: /^(TF_TOKEN_|TF_CLOUD_|TFE_)/,
+  cloud: /^(TF_TOKEN_|TF_CLOUD_|TFE_)/,
+  http: /^TF_HTTP_/,
+  consul: /^CONSUL_/,
+  cos: /^TENCENTCLOUD_/,
+  oss: /^(ALICLOUD_|ALIBABA_CLOUD_)/,
+  kubernetes: /^(KUBE_|KUBECONFIG$)/,
+  pg: /^PG/,
+};
+
+/** Operator opt-in for handing backend credential variables to terraform. */
+export function backendCredentialsAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.TERRAFORM_CWD_MCP_ALLOW_BACKEND_CREDENTIALS === "1";
+}
+
+/** PATH without empty or relative entries: those resolve against cwd, which is the untrusted root. */
+function absolutePathEntries(value: string): string {
+  return value
+    .split(delimiter)
+    .filter((p) => isAbsolute(p.replace(/^"|"$/g, "")))
+    .join(delimiter);
+}
+
 /**
- * Environment every terraform child gets. CHECKPOINT_DISABLE stops the version
- * check every terraform command otherwise sends to checkpoint-api.hashicorp.com
- * (`main.go` runs it in a goroutine), which would contradict `openWorldHint:
- * false` on the tools that only read local files.
+ * Environment for a terraform child: always an allowlist, so AWS_*, TF_VAR_*,
+ * TF_TOKEN_* and anything else a provider plugin could read are absent unless the
+ * profile adds them. TERRAFORM_CWD_MCP_PASS_ENV (comma-separated names) adds what a
+ * version-manager wrapper needs. Every profile sets CHECKPOINT_DISABLE, which stops
+ * the version check terraform otherwise sends to checkpoint-api.hashicorp.com.
  */
-export function terraformEnv(extra: Record<string, string | null> = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, TF_IN_AUTOMATION: "1", TF_INPUT: "0", CHECKPOINT_DISABLE: "1" };
+export function terraformEnv(
+  extra: Record<string, string | null> = {},
+  profile: EnvProfile = "scrubbed",
+  base: NodeJS.ProcessEnv = process.env,
+  backend?: string,
+): NodeJS.ProcessEnv {
+  const passed = new Set(
+    (base.TERRAFORM_CWD_MCP_PASS_ENV ?? "")
+      .split(",")
+      .map((n) => n.trim().toUpperCase())
+      .filter(Boolean),
+  );
+  const backendVars =
+    profile === "backend" &&
+    backend !== undefined &&
+    backendCredentialsAllowed(base) &&
+    Object.hasOwn(BACKEND_ENV, backend)
+      ? BACKEND_ENV[backend]
+      : undefined;
+  const keep = (name: string): boolean => {
+    if (BASE_ENV.has(name) || passed.has(name)) return true;
+    if (profile === "download") return DOWNLOAD_ENV.has(name) || /^TF_(TOKEN|REGISTRY)_/.test(name);
+    return backendVars !== undefined && (DOWNLOAD_ENV.has(name) || backendVars.test(name));
+  };
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (v === undefined || !keep(k.toUpperCase())) continue;
+    env[k] = k.toUpperCase() === "PATH" ? absolutePathEntries(v) : v;
+  }
+  // Whatever terraform starts by bare name (cmd.exe for a credential_process) must not resolve in cwd.
+  if (process.platform === "win32") env.NoDefaultCurrentDirectoryInExePath = "1";
+  env.TF_IN_AUTOMATION = "1";
+  env.TF_INPUT = "0";
+  env.CHECKPOINT_DISABLE = "1";
   for (const [k, v] of Object.entries(extra)) {
     if (v === null) delete env[k];
     else env[k] = v;
@@ -239,21 +407,25 @@ export function terraformEnv(extra: Record<string, string | null> = {}): NodeJS.
  * tens of MB, and any fixed buffer is a cliff somebody's provider set eventually
  * walks off.
  *
- * On Windows, CreateProcess resolves a bare `terraform` to `terraform.exe` on
- * PATH, so no shell is needed there either. A `.cmd` / `.bat` shim cannot run
- * without a shell (Node refuses with EINVAL since CVE-2024-27980), so it is
- * rejected up front with a message naming the fix.
+ * On Windows, a bare `terraform` resolves to `terraform.exe` on PATH, so no shell
+ * is needed there either. That lookup tries cwd first, and cwd is the root an agent
+ * may write to, unless NoDefaultCurrentDirectoryInExePath is set in THIS process
+ * (the check reads the parent's environment; the child's does not count). So it is
+ * set before every spawn. A `.cmd` / `.bat` shim cannot run without a shell (Node
+ * refuses with EINVAL since CVE-2024-27980), so it is rejected up front with a
+ * message naming the fix.
  */
 export function createTerraformExec(opts: RunnerOptions = {}): TerraformExec {
   const binary = opts.binary ?? (process.env.TERRAFORM_CWD_MCP_BINARY || "terraform");
   const defaultTimeout = opts.timeoutMs ?? defaultTimeoutMs();
-  return (args, { cwd, env, timeoutMs = defaultTimeout }) =>
+  return (args, { cwd, env, envProfile, backend, timeoutMs = defaultTimeout }) =>
     new Promise<RunResult>((resolvePromise, reject) => {
       const label = `terraform ${args.filter((a) => !a.startsWith("-")).join(" ")}`;
       if (isWindowsBatch(binary)) {
         reject(new Error(windowsBatchMessage(binary)));
         return;
       }
+      if (process.platform === "win32") process.env.NoDefaultCurrentDirectoryInExePath = "1";
       let child: ReturnType<typeof spawn>;
       try {
         child = spawn(binary, args, {
@@ -261,7 +433,7 @@ export function createTerraformExec(opts: RunnerOptions = {}): TerraformExec {
           shell: false,
           windowsHide: true,
           stdio: ["ignore", "pipe", "pipe"],
-          env: terraformEnv(env),
+          env: terraformEnv(env, envProfile, process.env, backend),
         });
       } catch (e) {
         reject(spawnError(binary, e as NodeJS.ErrnoException));
@@ -303,15 +475,99 @@ export class TimeoutError extends Error {
   }
 }
 
-/** `terraform providers schema -json` in `root`, returning stdout; a non-zero exit throws. */
+/**
+ * Backend type from `.terraform/terraform.tfstate` (`backend.type`), else `local`.
+ * Only `type` is read: `backend.config` can hold secrets passed via -backend-config.
+ * The file is writable by whoever can write the root, and the type is printed, so
+ * anything that is not a plain name becomes `unknown` (a remote type with no variables).
+ */
+export function backendType(root: string): string {
+  const file = join(root, ".terraform", "terraform.tfstate");
+  if (!existsSync(file)) return "local";
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as { backend?: { type?: unknown } };
+    const t = parsed.backend?.type;
+    if (typeof t !== "string" || !t) return "local";
+    return /^[A-Za-z0-9_-]+$/.test(t) ? t : "unknown";
+  } catch {
+    return "local";
+  }
+}
+
+const SCHEMA_ARGS = ["providers", "schema", "-json"];
+const PROVIDER_ADDRESS = /^[A-Za-z0-9.-]+\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/;
+
+function schemaFailure(code: number | null, stderr: string): Error {
+  return new Error(`terraform providers schema failed (exit ${code}):\n${stderr.trim()}`);
+}
+
+/**
+ * The schema dump for a root whose backend cannot be used without credentials.
+ * In the root itself `providers schema` reads state from the backend, so it runs
+ * in a temp dir instead: a generated backend-less configuration naming the locked
+ * providers, the root's lock file and a link to its installed packages. The
+ * `terraform_data` resource makes the builtin provider part of the dump.
+ */
+async function isolatedSchemaDump(root: string, exec: TerraformExec): Promise<string> {
+  const lock = readFileSync(join(root, ".terraform.lock.hcl"));
+  const addresses = Object.keys(parseLockVersions(lock.toString("utf8")));
+  const bad = addresses.find((a) => !PROVIDER_ADDRESS.test(a));
+  if (bad !== undefined) {
+    throw new Error(
+      `.terraform.lock.hcl in ${root} names an invalid provider address (${JSON.stringify(bad)}). Run terraform init there to rewrite it.`,
+    );
+  }
+  const tmp = mkdtempSync(join(tmpdir(), "tfcwd-schema-"));
+  try {
+    const required = addresses.map((a, i) => `    p${i} = { source = ${JSON.stringify(a)} }\n`).join("");
+    writeFileSync(
+      join(tmp, "main.tf"),
+      `terraform {\n  required_providers {\n${required}  }\n}\n\nresource "terraform_data" "tfcwd_builtin" {}\n`,
+      "utf8",
+    );
+    writeFileSync(join(tmp, ".terraform.lock.hcl"), lock);
+    mkdirSync(join(tmp, ".terraform"));
+    const providers = join(root, ".terraform", "providers");
+    if (existsSync(providers)) {
+      symlinkSync(
+        realpathSync(providers),
+        join(tmp, ".terraform", "providers"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+    }
+    const r = await exec(SCHEMA_ARGS, { cwd: tmp, env: { TF_DATA_DIR: null, TF_WORKSPACE: null } });
+    if (r.code !== 0) throw schemaFailure(r.code, r.stderr);
+    return r.stdout;
+  } finally {
+    try {
+      // Removes the link, never the packages behind it.
+      rmSync(tmp, { recursive: true, force: true, maxRetries: 5 });
+    } catch {
+      // the startup sweep catches leftovers
+    }
+  }
+}
+
+/**
+ * `terraform providers schema -json` for `root`, returning stdout; a failure
+ * throws. It starts every provider plugin, so it always runs scrubbed. A root
+ * with a configured backend is dumped through `isolatedSchemaDump`, because the
+ * command would otherwise need that backend's credentials.
+ */
 export function createTerraformRunner(
   opts: RunnerOptions = {},
   exec: TerraformExec = createTerraformExec(opts),
 ): SchemaRunner {
   return async (root) => {
-    const r = await exec(["providers", "schema", "-json"], { cwd: root });
-    if (r.code !== 0) throw new Error(`terraform providers schema failed (exit ${r.code}):\n${r.stderr.trim()}`);
-    return r.stdout;
+    if (backendType(root) === "local") {
+      const r = await exec(SCHEMA_ARGS, { cwd: root });
+      if (r.code === 0) return r.stdout;
+      // A backend block after `init -backend=false`: the root cannot answer, the isolated dump can.
+      if (!/backend initialization required/i.test(r.stderr.replace(/\s+/g, " "))) {
+        throw schemaFailure(r.code, r.stderr);
+      }
+    }
+    return isolatedSchemaDump(root, exec);
   };
 }
 
@@ -354,6 +610,10 @@ export interface StoreOptions {
   exec?: TerraformExec;
   /** Where tf_upgrade_impact keeps downloaded provider packages. */
   pluginCacheDir?: string;
+  /** Directories tools may use besides `defaultDir`. Default: TERRAFORM_CWD_MCP_ALLOWED_DIRS. */
+  allowedDirs?: string[];
+  /** Enable tf_upgrade_impact. Default: TERRAFORM_CWD_MCP_ALLOW_UPGRADE=1. */
+  allowUpgrade?: boolean;
 }
 
 /**
@@ -370,6 +630,8 @@ export class SchemaStore {
   readonly defaultDir: string;
   readonly exec: TerraformExec;
   readonly pluginCacheDir: string;
+  readonly allowUpgrade: boolean;
+  private readonly allowedDirs: string[];
   private readonly runner: SchemaRunner;
   /**
    * Keyed by resolved root, holding only that root's current lock key: a
@@ -385,13 +647,27 @@ export class SchemaStore {
     this.exec = opts.exec ?? createTerraformExec();
     this.runner = opts.runner ?? createTerraformRunner({}, this.exec);
     this.pluginCacheDir = opts.pluginCacheDir ?? defaultPluginCacheDir(this.cacheDir);
+    this.allowUpgrade = opts.allowUpgrade ?? process.env.TERRAFORM_CWD_MCP_ALLOW_UPGRADE === "1";
+    this.allowedDirs = [resolve(this.defaultDir), ...(opts.allowedDirs ?? parseAllowedDirs()).map((d) => resolve(d))];
   }
 
+  /** Throws unless `path` is inside the server's directory or an operator-allowed one (links resolved). */
+  assertAllowedDir(path: string): void {
+    if (this.allowedDirs.some((d) => isInsideDir(d, path))) return;
+    throw new Error(
+      `${path} is outside the directories this server may use (${this.allowedDirs.join(", ")}). Start the server ` +
+        "there, set TERRAFORM_CWD_MCP_DIR to it, or add it to TERRAFORM_CWD_MCP_ALLOWED_DIRS in the MCP client's " +
+        "server configuration, then restart the server.",
+    );
+  }
+
+  /** A tool's `dir` as an absolute path; relative paths resolve against the server's directory. */
   resolveRoot(dir?: string): string {
     const raw = dir || this.defaultDir;
     assertLocalPath(raw);
-    const root = resolve(raw);
+    const root = resolve(this.defaultDir, raw);
     assertLocalPath(root);
+    this.assertAllowedDir(root);
     return root;
   }
 

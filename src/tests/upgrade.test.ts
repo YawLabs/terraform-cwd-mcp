@@ -72,7 +72,7 @@ const RANDOM_EXPECTED = [
 
 async function upUnits(): Promise<{ root: string; units: ModuleUnit[] }> {
   const root = fixtureCopy("upgrade/uproot");
-  return { root, units: await loadModules(root) };
+  return { root, units: await loadModules(root, () => {}) };
 }
 
 describe("usage findings on the real fixture dumps (section 7.4)", () => {
@@ -682,11 +682,32 @@ function upgradeStore(o: FakeOpts = {}) {
   const seen = { validateDirs: [] as string[], overrides: [] as string[], links: [] as string[] };
   const exec = mk(fakeTerraform(pluginCache, seen, o));
   const runner = vi.fn(async () => readFixture("upgrade/schema-pinned.json"));
-  const store = new SchemaStore({ cacheDir: tempDir("tfcwd-cache-"), runner, exec, pluginCacheDir: pluginCache });
+  const store = new SchemaStore({
+    cacheDir: tempDir("tfcwd-cache-"),
+    runner,
+    exec,
+    pluginCacheDir: pluginCache,
+    allowUpgrade: true,
+  });
   return { store, exec, seen, pluginCache };
 }
 
 describe("upgradeImpact end to end (fake terraform, real files)", () => {
+  it("only the download gets network settings; everything that starts a plugin is scrubbed", async () => {
+    const { store, exec } = upgradeStore();
+    await upgradeImpact(store, {
+      provider: "hashicorp/tls",
+      version: "4.0.6",
+      dir: upgradeRoot(),
+      validate: true,
+      includeUnused: false,
+    });
+    const profiles = exec.mock.calls.map((c) => [c[0][0], c[1].envProfile ?? "scrubbed"]);
+    expect(profiles).toContainEqual(["init", "download"]);
+    expect(profiles.filter(([, p]) => p !== "scrubbed")).toEqual([["init", "download"]]);
+    expect(profiles.map(([cmd]) => cmd)).toEqual(expect.arrayContaining(["providers", "validate", "version"]));
+  });
+
   it("downloads into temp dirs, validates on a linked copy and leaves the root untouched", async () => {
     const root = upgradeRoot();
     const before = snapshot(root);
@@ -985,7 +1006,7 @@ describe("temp copy hygiene", () => {
     const devDir = process.platform === "win32" ? `\\\\?\\${certs}` : `/${certs}`;
     manifest.Modules.push({ Key: "dev", Source: "./dev", Dir: devDir });
     writeFileSync(file, JSON.stringify(manifest));
-    expect((await loadModules(root)).map((u) => u.key)).toEqual(["", "certs"]);
+    expect((await loadModules(root, () => {})).map((u) => u.key)).toEqual(["", "certs"]);
     const { store, seen } = upgradeStore();
     await tlsCall(store, root);
     expect(seen.validateDirs).toHaveLength(2);

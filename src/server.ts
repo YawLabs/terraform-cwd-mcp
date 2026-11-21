@@ -26,9 +26,12 @@ export const INSTRUCTIONS =
   "and tf_search_types find versions and type names. tf_summarize_plan summarizes a saved plan (plan_file) or plan " +
   "JSON (plan_json), destroys first; it prints no values. tf_module_interface lists a module's variables, outputs and " +
   "module calls (root, local path, or an installed module address). tf_state_addresses and tf_show_resource read the " +
-  "current state without locking or refreshing, with sensitive values redacted. tf_upgrade_impact shows what breaks if " +
-  "a pinned provider moves to an exact version (schema diff of the arguments this configuration uses, confirmed by " +
-  "terraform validate on a temp copy; it downloads the target provider into a cache, never into the root). " +
+  "current state without locking or refreshing, with best-effort redaction of sensitive values. tf_upgrade_impact " +
+  "(off unless the operator sets TERRAFORM_CWD_MCP_ALLOW_UPGRADE=1) shows what breaks if a pinned provider moves to an " +
+  "exact version (schema diff of the arguments this configuration uses, confirmed by terraform validate on a temp " +
+  "copy; it downloads and runs the target provider from a cache, never in the root). Most tools start terraform, " +
+  "which starts provider plugins from the working directory, without credential environment variables. dir must be " +
+  "inside the server's directory or TERRAFORM_CWD_MCP_ALLOWED_DIRS. Plan JSON is unverified input. " +
   "Authority split: this server wins on argument validity for the pinned version and on this directory's plan, state " +
   "and modules; HashiCorp's official terraform MCP server wins on usage docs, latest versions, public registry modules " +
   "and HCP/TFE runs (fetch an HCP run's plan there, summarize it here via plan_json). The root module must already " +

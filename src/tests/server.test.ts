@@ -36,7 +36,7 @@ describe("server", () => {
     expect(version).toBe(pkg.version);
   });
 
-  it("serves exactly the nine read-only tools with honest openWorld hints", async () => {
+  it("serves exactly the nine tools with honest hints", async () => {
     client = await connect({ cacheDir: tempDir(), runner: vi.fn(async () => FIXTURE_TEXT) });
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
@@ -50,13 +50,13 @@ describe("server", () => {
       "tf_summarize_plan",
       "tf_upgrade_impact",
     ]);
-    const openWorld = new Set(["tf_state_addresses", "tf_show_resource", "tf_upgrade_impact"]);
     for (const t of tools) {
+      const noSubprocess = t.name === "tf_module_interface";
       expect(t.description).toBeTruthy();
-      expect(t.annotations?.readOnlyHint).toBe(true);
+      expect(t.annotations?.readOnlyHint, t.name).toBe(noSubprocess);
       expect(t.annotations?.destructiveHint).toBe(false);
       expect(t.annotations?.idempotentHint).toBe(true);
-      expect(t.annotations?.openWorldHint, t.name).toBe(openWorld.has(t.name));
+      expect(t.annotations?.openWorldHint, t.name).toBe(!noSubprocess);
       expect(t.inputSchema.properties).toHaveProperty("dir");
       // Every string parameter is length-capped (compliance: security-oversized-input).
       for (const [name, p] of Object.entries(t.inputSchema.properties ?? {}) as [
