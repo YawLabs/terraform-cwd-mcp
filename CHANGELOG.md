@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] -- 2026-11-21
+
 ### Security
 - Terraform children no longer inherit the server's environment. Every command
   that can start a provider plugin gets an allowlisted environment without
