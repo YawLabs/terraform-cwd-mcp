@@ -50,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   described as best effort.
 
 ### Changed
+- The `terraform-cwd-mcp` command now requires oam 0.21.1 or newer (was
+  0.20.2); an older oam is passed over for Node, as before. Verified on oam
+  0.21.1 through the launcher: MCP handshake, `tools/list`,
+  `tf_module_interface`, `tf_list_providers` and `tf_upgrade_impact` match
+  Node, and a child spawned with `TF_DATA_DIR` deleted does not see it.
 - **Breaking:** a `dir` outside the server's directory is refused; set
   `TERRAFORM_CWD_MCP_DIR` or `TERRAFORM_CWD_MCP_ALLOWED_DIRS`. A relative `dir` now
   resolves against the server's directory.
